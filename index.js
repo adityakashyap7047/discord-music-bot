@@ -34,7 +34,7 @@ function createQueue(guildId) {
 }
 
 function getQueueData(guildId) {
-  return { getQueue, createQueue, queue };
+  return { getQueue, createQueue };
 }
 
 async function play(guildId) {
@@ -82,6 +82,10 @@ async function play(guildId) {
       play(guildId).catch(() => {});
     });
 
+if (!q.connection) {
+      console.error("No voice connection available");
+      return;
+    }
     q.connection.subscribe(q.player);
     q.player.play(resource);
     if (q.resource && q.resource.volume) {
@@ -90,7 +94,7 @@ async function play(guildId) {
   } catch (e) {
     console.error("Play error:", e);
     q.songs.shift();
-    play(guildId);
+    play(guildId).catch(() => {});
   }
 }
 
@@ -136,10 +140,13 @@ function setupVoiceConnection(guildId, voiceChannel, message) {
 function handlePlayCommand(message, args) {
   const guildId = message.guild.id;
   const textChannel = message.channel;
-  const voiceChannel = message.member.voice.channel;
+  const voiceChannel = message.member?.voice?.channel;
+  if (!voiceChannel) {
+    return message.reply("❌ You need to be in a voice channel to use this command!").catch(() => {});
+  }
 
   if (!args[0]) {
-    return message.reply("❌ Please provide a YouTube URL or search query!");
+    return message.reply("❌ Please provide a YouTube URL or search query!").catch(() => {});
   }
 
   const command = async () => {
@@ -160,18 +167,18 @@ function handlePlayCommand(message, args) {
         url = info.videoDetails.video_url;
         title = info.videoDetails.title;
       } catch (e) {
-        return message.reply("❌ Could not fetch video info!");
+        return message.reply("❌ Could not fetch video info!").catch(() => {});
       }
     } else {
       try {
         const searchResults = await yts(query);
         if (!searchResults.videos || searchResults.videos.length === 0) {
-          return message.reply("❌ Could not find any results!");
+          return message.reply("❌ Could not find any results!").catch(() => {});
         }
         url = searchResults.videos[0].url;
         title = searchResults.videos[0].title;
       } catch (e) {
-        return message.reply("❌ Could not find any results!");
+        return message.reply("❌ Could not find any results!").catch(() => {});
       }
     }
 
@@ -181,10 +188,17 @@ function handlePlayCommand(message, args) {
       setupVoiceConnection(guildId, voiceChannel, message);
       const waitForConnection = async () => {
         try {
+          if (!q.connection) {
+            message.reply("❌ Could not join voice channel!").catch(() => {});
+            return;
+          }
           await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
           play(guildId).catch(() => {});
         } catch {
-          play(guildId).catch(() => {});
+          if (q.connection) {
+            q.connection.destroy();
+          }
+          queue.delete(guildId);
         }
       };
       waitForConnection().catch(() => {});
@@ -246,7 +260,7 @@ function handleQueueCommand(message) {
 
 function handleLoopCommand(message) {
   const q = getQueue(message.guild.id);
-  if (!q || q.songs.length === 0) {
+  if (!q || !q.player || q.songs.length === 0) {
     return message.reply("❌ Nothing is playing!");
   }
   q.loop = !q.loop;
@@ -304,14 +318,16 @@ function handleNowPlayingCommand(message) {
 const VOICE_COMMANDS = ["play", "stop", "skip", "queue", "loop", "volume", "remove", "clear", "pause", "resume"];
 
 function handleMessageCreate(message) {
-  if (message.author.bot || !message.content.startsWith(PREFIX)) return;
+  if (message.author.bot || !message.content.startsWith(PREFIX) || !message.guild) return;
 
   const args = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
   const guildId = message.guild.id;
 
-  if (!message.member.voice.channel && VOICE_COMMANDS.includes(command)) {
-    return message.reply("❌ You need to be in a voice channel to use this command!");
+if (!message.member || !message.member.voice || !message.member.voice.channel) {
+    if (VOICE_COMMANDS.includes(command)) {
+      return message.reply("❌ You need to be in a voice channel to use this command!");
+    }
   }
 
   switch (command) {
