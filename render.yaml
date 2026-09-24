@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: discord-music-bot
+    env: node
+    plan: starter
+    start: npm start
+    envVars:
+      - key: DISCORD_TOKEN
+        from:
+          secret: discord-token
+    autoDeploy: true
