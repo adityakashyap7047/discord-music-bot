@@ -65,10 +65,10 @@ async function play(guildId) {
     q.player.removeAllListeners();
     q.player.on(AudioPlayerStatus.Idle, () => {
       if (q.loop) {
-        play(guildId);
+        play(guildId).catch(() => {});
       } else {
         q.songs.shift();
-        play(guildId);
+        play(guildId).catch(() => {});
       }
     });
 
@@ -79,7 +79,7 @@ async function play(guildId) {
     q.player.on("error", (error) => {
       console.error("Player error:", error);
       q.songs.shift();
-      play(guildId);
+      play(guildId).catch(() => {});
     });
 
     q.connection.subscribe(q.player);
