@@ -39,12 +39,21 @@ function isYouTubeUrl(s) {
   return /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(s);
 }
 
-async function resolveVideo(query) {
+async function resolveVideo(query, retries = 2) {
   const target = isYouTubeUrl(query) ? query : `ytsearch1:${query}`;
-  const json = await runYtDlp(["-J", "--no-playlist", target]);
-  const info = JSON.parse(json);
-  if (!info || !info.webpage_url) throw new Error("No results");
-  return { url: info.webpage_url, title: info.title || "Unknown" };
+  try {
+    const json = await runYtDlp(["-J", "--no-playlist", target]);
+    const info = JSON.parse(json);
+    if (!info || !info.webpage_url) throw new Error("No results");
+    return { url: info.webpage_url, title: info.title || "Unknown" };
+  } catch (e) {
+    if (retries > 0) {
+      await new Promise((r) => setTimeout(r, 1500));
+      return resolveVideo(query, retries - 1);
+    }
+    console.error("resolveVideo failed:", e.message);
+    throw e;
+  }
 }
 
 async function getStreamUrl(url) {
@@ -297,7 +306,8 @@ function handlePlayCommand(message, args) {
       url = resolved.url;
       title = resolved.title;
     } catch (e) {
-      return message.reply("❌ Could not find any results!").catch(() => {});
+      console.error("Play resolve error:", e.message);
+      return message.reply("❌ Couldn't fetch that track (YouTube may be rate-limiting). Please try again in a few seconds.").catch(() => {});
     }
 
     const q = addSongToQueue(guildId, url, title, textChannel);
@@ -377,8 +387,13 @@ function handleQueueCommand(message) {
   if (!q || q.songs.length === 0) {
     return message.reply("❌ The queue is empty!").catch(() => {});
   }
-  const list = q.songs.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
-  message.channel.send({ content: `📋 Queue:\n${list}` }).catch(() => {});
+  const MAX_LINES = 15;
+  const shown = q.songs.slice(0, MAX_LINES);
+  const list = shown.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
+  const more = q.songs.length > MAX_LINES ? `\n… and ${q.songs.length - MAX_LINES} more` : "";
+  let content = `📋 Queue:\n${list}${more}`;
+  if (content.length > 1900) content = content.slice(0, 1900) + "\n…";
+  message.channel.send({ content }).catch(() => {});
 }
 
 function handleLoopCommand(message) {
@@ -610,17 +625,19 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: "Not authenticated" });
 }
 
-function userHasGuild(guildId) {
-  if (!client.isReady()) return false;
-  const guild = client.guilds.cache.get(guildId);
-  if (!guild) return false;
-  return true;
+function userGuildEntry(user, guildId) {
+  return ((user && user.guilds) || []).find((g) => g.id === guildId) || null;
 }
 
-function getUserGuilds(user) {
-  if (!client.isReady() || !user || !user.guilds) return [];
-  const botGuildIds = new Set(client.guilds.cache.map((g) => g.id));
-  return user.guilds.filter((g) => botGuildIds.has(g.id));
+function canManageGuild(entry) {
+  if (!entry) return false;
+  if (entry.owner) return true;
+  try {
+    const perms = BigInt(entry.permissions || "0");
+    return (perms & 0x20n) === 0x20n || (perms & 0x8n) === 0x8n;
+  } catch {
+    return false;
+  }
 }
 
 // --- OAuth2 ---
@@ -718,7 +735,6 @@ app.get("/api/status", (req, res) => {
     users: ready ? client.guilds.cache.reduce((n, g) => n + g.memberCount, 0) : 0,
     memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal },
     queues: queue.size,
-    ytDlp: YTDLP,
     oauthConfigured: !!CLIENT_SECRET,
     startedAt: START_TIME,
   });
@@ -759,8 +775,9 @@ app.get("/api/servers", requireAuth, (req, res) => {
 
 app.get("/api/queue/:guildId", requireAuth, (req, res) => {
   const { guildId } = req.params;
-  const inUserGuilds = (req.session.user.guilds || []).some((g) => g.id === guildId);
-  if (!inUserGuilds) return res.status(403).json({ error: "Not your server" });
+  const entry = userGuildEntry(req.session.user, guildId);
+  if (!entry) return res.status(403).json({ error: "Not your server" });
+  if (!canManageGuild(entry)) return res.status(403).json({ error: "You don't have permission to manage this server" });
   const q = getQueue(guildId);
   if (!q) return res.json({ queue: [], nowPlaying: null, volume: 5, loop: false, voiceChannel: null });
   const nowPlaying = q.songs[0] || null;
@@ -776,8 +793,9 @@ app.get("/api/queue/:guildId", requireAuth, (req, res) => {
 
 app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
   const { guildId, action } = req.params;
-  const inUserGuilds = (req.session.user.guilds || []).some((g) => g.id === guildId);
-  if (!inUserGuilds) return res.status(403).json({ error: "Not your server" });
+  const entry = userGuildEntry(req.session.user, guildId);
+  if (!entry) return res.status(403).json({ error: "Not your server" });
+  if (!canManageGuild(entry)) return res.status(403).json({ error: "You don't have permission to manage this server" });
   const q = getQueue(guildId);
 
   switch (action) {
@@ -873,11 +891,7 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  if (client.isReady() && client.ws.status === 0) {
-    res.status(200).send("ok");
-  } else {
-    res.status(503).send("offline");
-  }
+  res.status(200).json({ status: "ok", discord: client.isReady() ? "online" : "offline" });
 });
 
 app.get("/robots.txt", (req, res) => {
@@ -885,6 +899,7 @@ app.get("/robots.txt", (req, res) => {
 });
 
 app.use((req, res) => {
+  if (req.path.startsWith("/api/")) return res.status(404).json({ error: "Not found" });
   if (req.method !== "GET" && req.method !== "HEAD") return res.status(404).send("Not found");
   const file = path.join(ROOT, "index.html");
   if (fs.existsSync(file)) return res.sendFile(file);
