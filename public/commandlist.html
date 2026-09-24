@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Commands — NOTIXMIX</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="/" class="logo">NOTIXMIX</a>
+      <div class="nav-links">
+        <a href="/#features">Features</a>
+        <a href="/commandlist">Commands</a>
+        <a href="/dashboard">Dashboard</a>
+        <a href="/auth/login?return=/dashboard" class="btn btn-primary btn-sm">Login</a>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container">
+    <section class="hero" style="padding-bottom:30px;">
+      <div class="hero-badge"><span class="dot"></span> COMMAND ARSENAL</div>
+      <h1 style="font-size:clamp(2rem,5vw,3.2rem);">All <span class="grad">Commands</span></h1>
+      <p>Use <code style="color:var(--accent2);font-family:var(--mono);">!</code> prefix on desktop or <code style="color:var(--accent2);font-family:var(--mono);">/</code> slash on mobile. You must be in a voice channel for playback commands.</p>
+    </section>
+
+    <section style="padding-top:0;">
+      <div class="cmd-group open">
+        <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
+          <span class="arrow">▶</span>
+          <h3>🎵 Playback</h3>
+          <span class="count">6 commands</span>
+        </div>
+        <div class="cmd-list">
+          <div class="cmd-row"><span class="name">play</span><code>!play &lt;url/query&gt;</code><code>Play a YouTube video or search</code></div>
+          <div class="cmd-row"><span class="name">skip</span><code>!skip</code><code>Skip current song</code></div>
+          <div class="cmd-row"><span class="name">stop</span><code>!stop</code><code>Stop and clear queue</code></div>
+          <div class="cmd-row"><span class="name">pause</span><code>!pause</code><code>Pause playback</code></div>
+          <div class="cmd-row"><span class="name">resume</span><code>!resume</code><code>Resume playback</code></div>
+          <div class="cmd-row"><span class="name">nowplaying</span><code>!np</code><code>Show current song</code></div>
+        </div>
+      </div>
+
+      <div class="cmd-group open">
+        <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
+          <span class="arrow">▶</span>
+          <h3>📋 Queue</h3>
+          <span class="count">4 commands</span>
+        </div>
+        <div class="cmd-list">
+          <div class="cmd-row"><span class="name">queue</span><code>!queue</code><code>Show the full queue</code></div>
+          <div class="cmd-row"><span class="name">loop</span><code>!loop</code><code>Toggle loop mode</code></div>
+          <div class="cmd-row"><span class="name">remove</span><code>!remove &lt;n&gt;</code><code>Remove song by number</code></div>
+          <div class="cmd-row"><span class="name">clear</span><code>!clear</code><code>Clear the queue</code></div>
+        </div>
+      </div>
+
+      <div class="cmd-group open">
+        <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
+          <span class="arrow">▶</span>
+          <h3>🔊 Audio</h3>
+          <span class="count">1 command</span>
+        </div>
+        <div class="cmd-list">
+          <div class="cmd-row"><span class="name">volume</span><code>!volume &lt;0-10&gt;</code><code>Set playback volume</code></div>
+        </div>
+      </div>
+
+      <div class="cmd-group open">
+        <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
+          <span class="arrow">▶</span>
+          <h3>ℹ️ Info</h3>
+          <span class="count">1 command</span>
+        </div>
+        <div class="cmd-list">
+          <div class="cmd-row"><span class="name">help</span><code>!help</code><code>List all commands</code></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <div class="container">
+      <div class="footer-links">
+        <a href="/">Home</a>
+        <a href="/#features">Features</a>
+        <a href="/dashboard">Dashboard</a>
+      </div>
+      <div>© 2026 NOTIXMIX.</div>
+    </div>
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>

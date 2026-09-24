@@ -4,12 +4,19 @@ const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, demuxProbe } = require("@discordjs/voice");
 const { execFile } = require("child_process");
 const https = require("https");
-const http = require("http");
 const path = require("path");
 const fs = require("fs");
+const express = require("express");
+const session = require("express-session");
+const cookieParser = require("cookie-parser");
 
 const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.DISCORD_CLIENT_ID || "1552647926780534874";
+const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const BASE_URL = process.env.BASE_URL || "";
 const PREFIX = "!";
+const BOT_NAME = "NOTIXMIX";
+const START_TIME = Date.now();
 
 function resolveYtDlp() {
   if (process.env.YTDLP_PATH && fs.existsSync(process.env.YTDLP_PATH)) return process.env.YTDLP_PATH;
@@ -47,7 +54,7 @@ async function getStreamUrl(url) {
 function openRemoteStream(url, redirects = 5) {
   return new Promise((resolve, reject) => {
     if (redirects <= 0) return reject(new Error("Too many redirects"));
-    const lib = url.startsWith("http:") ? http : https;
+    const lib = url.startsWith("http:") ? require("http") : https;
     const req = lib.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -437,17 +444,282 @@ function startBot() {
 process.on("uncaughtException", (err) => console.error("Uncaught exception:", err));
 process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
-module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue };
+// ---------------------------------------------------------------------------
+// Express dashboard
+// ---------------------------------------------------------------------------
+const app = express();
+const ROOT = path.join(__dirname, "public");
 
-const server = http.createServer((req, res) => {
-  if (client.isReady() && client.ws.status === 0) {
-    res.writeHead(200);
-    res.end("Bot is running");
-  } else {
-    res.writeHead(503);
-    res.end("Bot offline");
+app.set("trust proxy", 1);
+app.use(cookieParser());
+app.use(express.json());
+app.use(session({
+  secret: process.env.SESSION_SECRET || "notixmix-dashboard-secret",
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 7 * 24 * 60 * 60 * 1000 },
+}));
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
+
+app.use(express.static(ROOT, { extensions: ["html"] }));
+
+function getBaseUrl(req) {
+  if (BASE_URL) return BASE_URL.replace(/\/$/, "");
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+function requireAuth(req, res, next) {
+  if (req.session && req.session.user) return next();
+  return res.status(401).json({ error: "Not authenticated" });
+}
+
+function userHasGuild(guildId) {
+  if (!client.isReady()) return false;
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return false;
+  return true;
+}
+
+function getUserGuilds(user) {
+  if (!client.isReady() || !user || !user.guilds) return [];
+  const botGuildIds = new Set(client.guilds.cache.map((g) => g.id));
+  return user.guilds.filter((g) => botGuildIds.has(g.id));
+}
+
+// --- OAuth2 ---
+app.get("/auth/login", (req, res) => {
+  if (!CLIENT_SECRET) {
+    return res.status(500).send("DISCORD_CLIENT_SECRET is not configured.");
+  }
+  const redirect = `${getBaseUrl(req)}/auth/callback`;
+  req.session.returnTo = req.query.return || "/dashboard";
+  const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&scope=identify%20guilds`;
+  res.redirect(url);
+});
+
+app.get("/auth/callback", async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.redirect("/");
+  const redirect = `${getBaseUrl(req)}/auth/callback`;
+  try {
+    const tokenRes = await new Promise((resolve, reject) => {
+      const data = new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        grant_type: "authorization_code",
+        code: String(code),
+        redirect_uri: redirect,
+      }).toString();
+      const r = https.request("https://discord.com/api/v10/oauth2/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      }, (resp) => {
+        let b = "";
+        resp.on("data", (c) => (b += c));
+        resp.on("end", () => resolve({ status: resp.statusCode, body: b }));
+      });
+      r.on("error", reject);
+      r.end(data);
+    });
+    const tok = JSON.parse(tokenRes.body);
+    if (!tok.access_token) return res.redirect("/");
+
+    const fetchJson = (pathName, accessToken) => new Promise((resolve, reject) => {
+      const r = https.get(`https://discord.com/api/v10${pathName}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, (resp) => {
+        let b = "";
+        resp.on("data", (c) => (b += c));
+        resp.on("end", () => {
+          try { resolve(JSON.parse(b)); } catch (e) { reject(e); }
+        });
+      });
+      r.on("error", reject);
+    });
+
+    const me = await fetchJson("/users/@me", tok.access_token);
+    const guilds = await fetchJson("/users/@me/guilds", tok.access_token);
+    req.session.user = {
+      id: me.id,
+      username: me.username,
+      globalName: me.global_name || me.username,
+      avatar: me.avatar
+        ? `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png?size=64`
+        : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(me.id) >> 22n) % 6}.png`,
+      guilds: Array.isArray(guilds) ? guilds : [],
+      accessToken: tok.access_token,
+    };
+    const back = req.session.returnTo || "/dashboard";
+    delete req.session.returnTo;
+    res.redirect(back);
+  } catch (e) {
+    console.error("OAuth error:", e);
+    res.redirect("/");
   }
 });
-server.listen(process.env.PORT || 3000);
+
+app.get("/auth/logout", (req, res) => {
+  req.session.destroy(() => res.redirect("/"));
+});
+
+// --- API ---
+app.get("/api/status", (req, res) => {
+  const ready = client.isReady();
+  const mem = process.memoryUsage();
+  res.json({
+    online: ready,
+    name: ready ? client.user.tag : BOT_NAME,
+    botId: CLIENT_ID,
+    latency: ready ? client.ws.ping : null,
+    uptime: ready ? client.uptime : null,
+    serverUptime: process.uptime(),
+    guilds: ready ? client.guilds.cache.size : 0,
+    users: ready ? client.guilds.cache.reduce((n, g) => n + g.memberCount, 0) : 0,
+    memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal },
+    queues: queue.size,
+    ytDlp: YTDLP,
+    oauthConfigured: !!CLIENT_SECRET,
+    startedAt: START_TIME,
+  });
+});
+
+app.get("/api/me", (req, res) => {
+  if (!req.session.user) return res.json({ authenticated: false });
+  const { id, username, globalName, avatar, guilds } = req.session.user;
+  res.json({ authenticated: true, user: { id, username, globalName, avatar, guilds } });
+});
+
+app.get("/api/servers", requireAuth, (req, res) => {
+  const userGuilds = req.session.user.guilds || [];
+  const botGuildIds = new Set(client.isReady() ? client.guilds.cache.map((g) => g.id) : []);
+  const mapped = userGuilds.map((g) => {
+    const perms = BigInt(g.permissions || "0");
+    const manage = (perms & 0x20n) === 0x20n || (perms & 0x8n) === 0x8n;
+    const inBot = botGuildIds.has(g.id);
+    const botGuild = inBot ? client.guilds.cache.get(g.id) : null;
+    return {
+      id: g.id,
+      name: g.name,
+      icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=64` : null,
+      owner: !!g.owner,
+      canManage: manage,
+      inBot,
+      members: botGuild ? botGuild.memberCount : null,
+      playing: queue.has(g.id) && queue.get(g.id).songs.length > 0,
+    };
+  });
+  res.json({ servers: mapped });
+});
+
+app.get("/api/queue/:guildId", requireAuth, (req, res) => {
+  const { guildId } = req.params;
+  const inUserGuilds = (req.session.user.guilds || []).some((g) => g.id === guildId);
+  if (!inUserGuilds) return res.status(403).json({ error: "Not your server" });
+  const q = getQueue(guildId);
+  if (!q) return res.json({ queue: [], nowPlaying: null, volume: 5, loop: false, voiceChannel: null });
+  const nowPlaying = q.songs[0] || null;
+  res.json({
+    queue: q.songs.map((s, i) => ({ index: i, title: s.title, url: s.url })),
+    nowPlaying,
+    volume: q.volume,
+    loop: q.loop,
+    voiceChannel: q.voiceChannel ? { id: q.voiceChannel.id, name: q.voiceChannel.name } : null,
+    playerState: q.player ? q.player.state.status : null,
+  });
+});
+
+app.post("/api/control/:guildId/:action", requireAuth, (req, res) => {
+  const { guildId, action } = req.params;
+  const inUserGuilds = (req.session.user.guilds || []).some((g) => g.id === guildId);
+  if (!inUserGuilds) return res.status(403).json({ error: "Not your server" });
+  const q = getQueue(guildId);
+
+  switch (action) {
+    case "pause":
+      if (!q || !q.player) return res.status(400).json({ error: "Nothing playing" });
+      q.player.pause();
+      break;
+    case "resume":
+      if (!q || !q.player) return res.status(400).json({ error: "Nothing playing" });
+      q.player.unpause();
+      break;
+    case "skip":
+      if (!q || !q.player) return res.status(400).json({ error: "Nothing playing" });
+      q.player.stop();
+      break;
+    case "stop":
+      if (!q) return res.status(400).json({ error: "Nothing playing" });
+      q.songs = [];
+      if (q.player) q.player.stop();
+      if (q.connection) q.connection.destroy();
+      queue.delete(guildId);
+      break;
+    case "loop":
+      if (!q) return res.status(400).json({ error: "No queue" });
+      q.loop = !q.loop;
+      break;
+    case "remove": {
+      if (!q) return res.status(400).json({ error: "No queue" });
+      const idx = parseInt(req.body && req.body.index, 10);
+      if (isNaN(idx) || idx < 0 || idx >= q.songs.length) return res.status(400).json({ error: "Invalid index" });
+      q.songs.splice(idx, 1);
+      break;
+    }
+    case "clear":
+      if (!q) return res.status(400).json({ error: "No queue" });
+      q.songs = [];
+      if (q.player) q.player.stop();
+      if (q.connection) q.connection.destroy();
+      queue.delete(guildId);
+      break;
+    case "volume": {
+      if (!q) return res.status(400).json({ error: "No queue" });
+      const vol = parseInt(req.body && req.body.volume, 10);
+      if (isNaN(vol) || vol < 0 || vol > 10) return res.status(400).json({ error: "Volume 0-10" });
+      q.volume = vol;
+      if (q.player && q.resource && q.resource.volume) q.resource.volume.setVolume(vol / 10);
+      break;
+    }
+    case "play": {
+      if (!q || q.songs.length === 0) return res.status(400).json({ error: "Queue empty" });
+      play(guildId).catch(() => {});
+      break;
+    }
+    default:
+      return res.status(400).json({ error: "Unknown action" });
+  }
+  res.json({ ok: true });
+});
+
+app.get("/health", (req, res) => {
+  if (client.isReady() && client.ws.status === 0) {
+    res.status(200).send("ok");
+  } else {
+    res.status(503).send("offline");
+  }
+});
+
+app.get("/robots.txt", (req, res) => {
+  res.type("text/plain").send("User-agent: *\nAllow: /\nDisallow: /dashboard\nDisallow: /api\nDisallow: /auth\n");
+});
+
+app.use((req, res) => {
+  if (req.method !== "GET" && req.method !== "HEAD") return res.status(404).send("Not found");
+  const file = path.join(ROOT, "index.html");
+  if (fs.existsSync(file)) return res.sendFile(file);
+  res.status(404).send("Not found");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Dashboard running on port ${PORT}`));
+
+module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue, app, client };
 
 startBot();

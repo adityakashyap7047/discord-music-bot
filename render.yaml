@@ -14,5 +14,13 @@ services:
         value: "3000"
       - key: DISCORD_TOKEN
         description: "Your Discord bot token"
+      - key: DISCORD_CLIENT_ID
+        value: "1552647926780534874"
+      - key: DISCORD_CLIENT_SECRET
+        description: "OAuth2 client secret from Discord Developer Portal"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: BASE_URL
+        description: "Public URL of this service, e.g. https://your-app.onrender.com"
     autoDeploy: true
-    healthCheckPath: /
+    healthCheckPath: /health

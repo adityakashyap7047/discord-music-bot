@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard — NOTIXMIX</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <nav>
+    <div class="nav-inner">
+      <a href="/" class="logo">NOTIXMIX</a>
+      <div class="nav-links">
+        <a href="/#features">Features</a>
+        <a href="/commandlist">Commands</a>
+        <a href="/dashboard" style="color:var(--accent2);">Dashboard</a>
+        <span id="user-slot"></span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div id="login-view" class="login-card" style="display:none;">
+      <h2>🔐 Dashboard Login</h2>
+      <p>Sign in with Discord to see your servers, control playback, and manage queues in real time.</p>
+      <a href="/auth/login?return=/dashboard" class="btn btn-primary">⚡ Login with Discord</a>
+      <p style="margin-top:20px;font-size:0.85rem;">Only servers where NOTIXMIX is present and you have permissions will be shown.</p>
+    </div>
+
+    <div class="dash-layout" id="dash-view" style="display:none;">
+      <aside class="sidebar">
+        <h4>📊 Bot Status</h4>
+        <div class="status-grid" style="grid-template-columns:1fr 1fr;margin-bottom:20px;">
+          <div class="status-item"><div class="v" id="d-latency">--</div><div class="l">Ping</div></div>
+          <div class="status-item"><div class="v" id="d-guilds">--</div><div class="l">Guilds</div></div>
+          <div class="status-item"><div class="v" id="d-users">--</div><div class="l">Users</div></div>
+          <div class="status-item"><div class="v" id="d-uptime">--</div><div class="l">Uptime</div></div>
+        </div>
+        <h4>🏠 Your Servers</h4>
+        <div id="server-list"><div class="empty">Loading servers...</div></div>
+      </aside>
+
+      <main class="main-panel">
+        <div class="panel">
+          <div class="panel-title"><span class="live"></span> Now Playing</div>
+          <div id="now-playing"><div class="empty">Select a server to view playback.</div></div>
+          <div class="controls" id="controls" style="display:none;">
+            <button class="ctrl-btn primary" id="btn-play" title="Resume/Play">▶</button>
+            <button class="ctrl-btn" id="btn-pause" title="Pause">⏸</button>
+            <button class="ctrl-btn" id="btn-skip" title="Skip">⏭</button>
+            <button class="ctrl-btn danger" id="btn-stop" title="Stop">⏹</button>
+            <button class="ctrl-btn" id="btn-loop" title="Toggle Loop">🔁</button>
+            <button class="ctrl-btn danger" id="btn-clear" title="Clear Queue">🗑</button>
+          </div>
+          <div class="vol-row" id="vol-row" style="display:none;">
+            <span style="font-size:0.9rem;color:var(--muted);">🔊</span>
+            <input type="range" id="vol-slider" min="0" max="10" step="1" value="5" />
+            <span class="vol-val" id="vol-val">5</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">📋 Queue <span id="q-count" style="color:var(--accent2);"></span></div>
+          <div id="queue-view"><div class="empty">Queue is empty.</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">🚀 Quick Play</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <input type="text" id="quick-input" placeholder="YouTube URL or search query..." style="flex:1;min-width:200px;padding:12px 16px;border-radius:10px;background:var(--card2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:0.9rem;" />
+            <button class="btn btn-primary btn-sm" id="quick-btn" style="padding:12px 22px;">▶ Play</button>
+          </div>
+          <p style="color:var(--muted);font-size:0.8rem;margin-top:10px;">Note: you must be in a voice channel in Discord for the bot to join and play.</p>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
