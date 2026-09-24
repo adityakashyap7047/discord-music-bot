@@ -1,11 +1,68 @@
 require("dotenv").config();
+process.env.FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, demuxProbe } = require("@discordjs/voice");
-const ytdl = require("ytdl-core");
-const yts = require("yt-search");
+const { execFile } = require("child_process");
+const https = require("https");
+const http = require("http");
+const path = require("path");
+const fs = require("fs");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = "!";
+
+function resolveYtDlp() {
+  if (process.env.YTDLP_PATH && fs.existsSync(process.env.YTDLP_PATH)) return process.env.YTDLP_PATH;
+  const local = path.join(__dirname, process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp");
+  if (fs.existsSync(local)) return local;
+  return "yt-dlp";
+}
+const YTDLP = resolveYtDlp();
+
+function runYtDlp(args, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    execFile(YTDLP, ["--no-warnings", ...args], { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+function isYouTubeUrl(s) {
+  return /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(s);
+}
+
+async function resolveVideo(query) {
+  const target = isYouTubeUrl(query) ? query : `ytsearch1:${query}`;
+  const json = await runYtDlp(["-J", "--no-playlist", target]);
+  const info = JSON.parse(json);
+  if (!info || !info.webpage_url) throw new Error("No results");
+  return { url: info.webpage_url, title: info.title || "Unknown" };
+}
+
+async function getStreamUrl(url) {
+  return runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
+}
+
+function openRemoteStream(url, redirects = 5) {
+  return new Promise((resolve, reject) => {
+    if (redirects <= 0) return reject(new Error("Too many redirects"));
+    const lib = url.startsWith("http:") ? http : https;
+    const req = lib.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return openRemoteStream(res.headers.location, redirects - 1).then(resolve, reject);
+      }
+      if (res.statusCode !== 200 && res.statusCode !== 206) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      resolve(res);
+    });
+    req.on("error", reject);
+    req.setTimeout(30000, () => { req.destroy(new Error("Stream timeout")); });
+  });
+}
 
 function createClient() {
   return new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
@@ -33,10 +90,6 @@ function createQueue(guildId) {
   return q;
 }
 
-function getQueueData(guildId) {
-  return { getQueue, createQueue };
-}
-
 async function play(guildId) {
   const q = getQueue(guildId);
   if (!q || q.songs.length === 0) {
@@ -50,8 +103,9 @@ async function play(guildId) {
   const song = q.songs[0];
 
   try {
-    const stream = ytdl(song.url, { filter: "audioonly", highWaterMark: 1 << 25 });
-    const probe = await demuxProbe(stream);
+    const streamUrl = await getStreamUrl(song.url);
+    const remote = await openRemoteStream(streamUrl);
+    const probe = await demuxProbe(remote);
     const resource = createAudioResource(probe.stream, {
       inputType: probe.type,
       inlineVolume: true,
@@ -82,7 +136,7 @@ async function play(guildId) {
       play(guildId).catch(() => {});
     });
 
-if (!q.connection) {
+    if (!q.connection) {
       console.error("No voice connection available");
       return;
     }
@@ -153,33 +207,12 @@ function handlePlayCommand(message, args) {
     const query = args.join(" ");
     let url;
     let title;
-    const getInfo = async (u) => {
-      const info = await ytdl.getInfo(u, {
-        requestOptions: {
-          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-        },
-      });
-      return info;
-    };
-    if (ytdl.validateURL(query)) {
-      try {
-        const info = await getInfo(query);
-        url = info.videoDetails.video_url;
-        title = info.videoDetails.title;
-      } catch (e) {
-        return message.reply("❌ Could not fetch video info!").catch(() => {});
-      }
-    } else {
-      try {
-        const searchResults = await yts(query);
-        if (!searchResults.videos || searchResults.videos.length === 0) {
-          return message.reply("❌ Could not find any results!").catch(() => {});
-        }
-        url = searchResults.videos[0].url;
-        title = searchResults.videos[0].title;
-      } catch (e) {
-        return message.reply("❌ Could not find any results!").catch(() => {});
-      }
+    try {
+      const resolved = await resolveVideo(query);
+      url = resolved.url;
+      title = resolved.title;
+    } catch (e) {
+      return message.reply("❌ Could not find any results!").catch(() => {});
     }
 
     const q = addSongToQueue(guildId, url, title, textChannel);
@@ -322,9 +355,8 @@ function handleMessageCreate(message) {
 
   const args = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
-  const guildId = message.guild.id;
 
-if (!message.member || !message.member.voice || !message.member.voice.channel) {
+  if (!message.member || !message.member.voice || !message.member.voice.channel) {
     if (VOICE_COMMANDS.includes(command)) {
       return message.reply("❌ You need to be in a voice channel to use this command!");
     }
@@ -359,7 +391,6 @@ function startBot() {
 
 module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue };
 
-const http = require("http");
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("Bot is running");
