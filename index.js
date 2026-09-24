@@ -170,19 +170,22 @@ function setupVoiceConnection(guildId, voiceChannel, message) {
       });
       q.voiceChannel = voiceChannel;
       q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        if (!queue.has(guildId)) return;
         try {
-          await entersState(q.connection, VoiceConnectionStatus.Signalling, 5000);
+          await Promise.race([
+            entersState(q.connection, VoiceConnectionStatus.Signalling, 5000),
+            entersState(q.connection, VoiceConnectionStatus.Connecting, 5000),
+            entersState(q.connection, VoiceConnectionStatus.Ready, 5000),
+          ]);
         } catch {
-          q.connection.destroy();
-          queue.delete(guildId);
-        }
-      });
-      q.connection.on(VoiceConnectionStatus.Signalling, async () => {
-        try {
-          await entersState(q.connection, VoiceConnectionStatus.Ready, 5000);
-        } catch {
-          q.connection.destroy();
-          queue.delete(guildId);
+          try {
+            await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+          } catch {
+            if (queue.has(guildId)) {
+              q.connection.destroy();
+              queue.delete(guildId);
+            }
+          }
         }
       });
     } catch (e) {
@@ -379,21 +382,67 @@ function handleMessageCreate(message) {
   }
 }
 
+function applyPresence() {
+  if (!client.isReady()) return;
+  client.user.setActivity("Music | !play", { type: ActivityType.Listening }).catch(() => {});
+  client.user.setStatus("online").catch(() => {});
+}
+
+let loginAttempts = 0;
+
+function login() {
+  client.login(TOKEN).catch((err) => {
+    console.error("Login failed:", err);
+    loginAttempts += 1;
+    setTimeout(login, Math.min(15000 * loginAttempts, 60000));
+  });
+}
+
+function relogin() {
+  try {
+    client.destroy();
+  } catch {}
+  setTimeout(login, 5000);
+}
+
 function startBot() {
   client.on("ready", () => {
     console.log(`Logged in as ${client.user.tag}`);
-    client.user.setActivity("Music | !play", { type: ActivityType.Listening });
+    loginAttempts = 0;
+    applyPresence();
+  });
+
+  client.on("shardReady", () => applyPresence());
+  client.on("shardDisconnect", (info) => console.warn("Shard disconnected:", info));
+  client.on("shardReconnecting", () => console.warn("Shard reconnecting..."));
+  client.on("shardError", (err) => console.error("Shard error:", err));
+  client.on("error", (err) => console.error("Client error:", err));
+  client.on("warn", (info) => console.warn("Client warn:", info));
+  client.on("invalidated", () => {
+    console.error("Session invalidated, re-logging in...");
+    relogin();
   });
 
   client.on("messageCreate", handleMessageCreate);
-  client.login(TOKEN);
+
+  setInterval(applyPresence, 30 * 60 * 1000);
+
+  login();
 }
+
+process.on("uncaughtException", (err) => console.error("Uncaught exception:", err));
+process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue };
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Bot is running");
+  if (client.isReady() && client.ws.status === 0) {
+    res.writeHead(200);
+    res.end("Bot is running");
+  } else {
+    res.writeHead(503);
+    res.end("Bot offline");
+  }
 });
 server.listen(process.env.PORT || 3000);
 
