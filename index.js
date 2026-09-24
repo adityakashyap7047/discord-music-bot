@@ -6,6 +6,7 @@ const { execFile } = require("child_process");
 const https = require("https");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const express = require("express");
 const session = require("express-session");
 const cookieParser = require("cookie-parser");
@@ -48,7 +49,8 @@ async function resolveVideo(query) {
 }
 
 async function getStreamUrl(url) {
-  return runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
+  const out = await runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
+  return out.split(/\r?\n/)[0] || out;
 }
 
 function openRemoteStream(url, redirects = 5) {
@@ -58,7 +60,8 @@ function openRemoteStream(url, redirects = 5) {
     const req = lib.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        return openRemoteStream(res.headers.location, redirects - 1).then(resolve, reject);
+        const next = new URL(res.headers.location, url).toString();
+        return openRemoteStream(next, redirects - 1).then(resolve, reject);
       }
       if (res.statusCode !== 200 && res.statusCode !== 206) {
         res.resume();
@@ -92,31 +95,60 @@ function createQueue(guildId) {
     connection: null,
     player: null,
     resource: null,
+    _starting: false,
+    _announceNext: false,
+    _advanceMode: null, // null = default advance, "keep" = songs already adjusted, "force" = advance even when looping
   };
   queue.set(guildId, q);
   return q;
 }
 
+function destroyVoice(q) {
+  try {
+    if (q && q.connection && q.connection.state && q.connection.state.status !== "destroyed") {
+      q.connection.destroy();
+    }
+  } catch (e) {
+    console.error("Voice destroy failed:", e);
+  }
+}
+
+function destroyQueue(guildId, q) {
+  destroyVoice(q);
+  queue.delete(guildId);
+}
+
 async function play(guildId) {
   const q = getQueue(guildId);
   if (!q || q.songs.length === 0) {
-    if (q && q.connection) {
-      q.connection.destroy();
-      queue.delete(guildId);
-    }
+    if (q) destroyQueue(guildId, q);
     return;
   }
+  if (q._starting) return;
+  q._starting = true;
 
   const song = q.songs[0];
+  let remote = null;
 
   try {
     const streamUrl = await getStreamUrl(song.url);
-    const remote = await openRemoteStream(streamUrl);
+    if (getQueue(guildId) !== q) {
+      q._starting = false;
+      return;
+    }
+    remote = await openRemoteStream(streamUrl);
     const probe = await demuxProbe(remote);
     const resource = createAudioResource(probe.stream, {
       inputType: probe.type,
       inlineVolume: true,
     });
+
+    if (getQueue(guildId) !== q) {
+      if (remote && !remote.destroyed) remote.destroy();
+      q._starting = false;
+      return;
+    }
+
     q.resource = resource;
 
     if (!q.player) {
@@ -125,28 +157,40 @@ async function play(guildId) {
 
     q.player.removeAllListeners();
     q.player.on(AudioPlayerStatus.Idle, () => {
-      if (q.loop) {
+      const mode = q._advanceMode;
+      q._advanceMode = null;
+      if (mode === "keep") {
+        play(guildId).catch(() => {});
+      } else if (mode === "force" || !q.loop) {
+        q.songs.shift();
         play(guildId).catch(() => {});
       } else {
-        q.songs.shift();
         play(guildId).catch(() => {});
       }
     });
 
     q.player.on(AudioPlayerStatus.Playing, () => {
-      q.textChannel.send({ content: `🎵 Now playing: **${song.title}**` }).catch(() => {});
+      if (!q._announceNext) return;
+      q._announceNext = false;
+      if (q.textChannel) {
+        q.textChannel.send({ content: `🎵 Now playing: **${song.title}**` }).catch(() => {});
+      }
     });
 
     q.player.on("error", (error) => {
       console.error("Player error:", error);
-      q.songs.shift();
-      play(guildId).catch(() => {});
+      // The player transitions to Idle right after emitting "error";
+      // flag the advance so the Idle handler drops the broken track
+      // even when loop is enabled (and does not advance twice).
+      if (!q._advanceMode) q._advanceMode = "force";
     });
 
-    if (!q.connection) {
-      console.error("No voice connection available");
+    if (!q.connection || getQueue(guildId) !== q) {
+      if (remote && !remote.destroyed) remote.destroy();
+      q._starting = false;
       return;
     }
+    q._announceNext = true;
     q.connection.subscribe(q.player);
     q.player.play(resource);
     if (q.resource && q.resource.volume) {
@@ -154,9 +198,17 @@ async function play(guildId) {
     }
   } catch (e) {
     console.error("Play error:", e);
-    q.songs.shift();
-    play(guildId).catch(() => {});
+    if (remote && !remote.destroyed) remote.destroy();
+    if (getQueue(guildId) !== q) {
+      q._starting = false;
+      return;
+    }
+    if (q.songs[0] === song) q.songs.shift();
+    q._advanceMode = null;
+    q._starting = false;
+    return play(guildId);
   }
+  q._starting = false;
 }
 
 function addSongToQueue(guildId, url, title, textChannel) {
@@ -177,21 +229,17 @@ function setupVoiceConnection(guildId, voiceChannel, message) {
       });
       q.voiceChannel = voiceChannel;
       q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        if (!queue.has(guildId)) return;
+        if (getQueue(guildId) !== q) return;
         try {
           await Promise.race([
             entersState(q.connection, VoiceConnectionStatus.Signalling, 5000),
             entersState(q.connection, VoiceConnectionStatus.Connecting, 5000),
-            entersState(q.connection, VoiceConnectionStatus.Ready, 5000),
           ]);
+          await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
         } catch {
-          try {
-            await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
-          } catch {
-            if (queue.has(guildId)) {
-              q.connection.destroy();
-              queue.delete(guildId);
-            }
+          if (getQueue(guildId) === q) {
+            destroyVoice(q);
+            queue.delete(guildId);
           }
         }
       });
@@ -232,16 +280,16 @@ function handlePlayCommand(message, args) {
       const waitForConnection = async () => {
         try {
           if (!q.connection) {
+            queue.delete(guildId);
             message.reply("❌ Could not join voice channel!").catch(() => {});
             return;
           }
           await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
           play(guildId).catch(() => {});
         } catch {
-          if (q.connection) {
-            q.connection.destroy();
-          }
+          destroyVoice(q);
           queue.delete(guildId);
+          message.reply("❌ Could not join voice channel!").catch(() => {});
         }
       };
       waitForConnection().catch(() => {});
@@ -255,47 +303,52 @@ function handlePlayCommand(message, args) {
 
 function handleSkipCommand(message) {
   const q = getQueue(message.guild.id);
-  if (!q || !q.player) {
-    return message.reply("❌ Nothing is playing!");
+  if (!q || !q.player || q.songs.length === 0 || q.player.state.status === AudioPlayerStatus.Idle) {
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
-  q.player.stop();
-  message.reply("⏭️ Skipped!").catch(() => {});
+  q._advanceMode = "force";
+  q.player.stop(true);
+  message.reply(q.songs.length === 0 ? "⏭️ Skipped — the queue has finished!" : "⏭️ Skipped!").catch(() => {});
 }
 
 function handleStopCommand(message) {
   const q = getQueue(message.guild.id);
-  if (!q || !q.player) {
-    return message.reply("❌ Nothing is playing!");
+  if (!q) {
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
   q.songs = [];
-  q.player.stop();
-  if (q.connection) q.connection.destroy();
   queue.delete(message.guild.id);
+  if (q.player) q.player.stop(true);
+  destroyVoice(q);
   message.reply("⏹️ Stopped!").catch(() => {});
 }
 
 function handlePauseCommand(message) {
   const q = getQueue(message.guild.id);
   if (!q || !q.player) {
-    return message.reply("❌ Nothing is playing!");
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
-  q.player.pause();
+  if (!q.player.pause()) {
+    return message.reply("⚠️ Playback is not active right now!").catch(() => {});
+  }
   message.reply("⏸️ Paused!").catch(() => {});
 }
 
 function handleResumeCommand(message) {
   const q = getQueue(message.guild.id);
   if (!q || !q.player) {
-    return message.reply("❌ Nothing is playing!");
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
-  q.player.unpause();
+  if (!q.player.unpause()) {
+    return message.reply("⚠️ Playback is not paused!").catch(() => {});
+  }
   message.reply("▶️ Resumed!").catch(() => {});
 }
 
 function handleQueueCommand(message) {
   const q = getQueue(message.guild.id);
   if (!q || q.songs.length === 0) {
-    return message.reply("❌ The queue is empty!");
+    return message.reply("❌ The queue is empty!").catch(() => {});
   }
   const list = q.songs.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
   message.channel.send({ content: `📋 Queue:\n${list}` }).catch(() => {});
@@ -303,8 +356,8 @@ function handleQueueCommand(message) {
 
 function handleLoopCommand(message) {
   const q = getQueue(message.guild.id);
-  if (!q || !q.player || q.songs.length === 0) {
-    return message.reply("❌ Nothing is playing!");
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
   q.loop = !q.loop;
   message.reply(q.loop ? "🔁 Loop enabled!" : "🔁 Loop disabled!").catch(() => {});
@@ -313,11 +366,11 @@ function handleLoopCommand(message) {
 function handleVolumeCommand(message, args) {
   const q = getQueue(message.guild.id);
   if (!q) {
-    return message.reply("❌ Nothing is playing!");
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
   const vol = parseInt(args[0]);
   if (isNaN(vol) || vol < 0 || vol > 10) {
-    return message.reply("❌ Volume must be between 0 and 10!");
+    return message.reply("❌ Volume must be between 0 and 10!").catch(() => {});
   }
   q.volume = vol;
   if (q.player && q.resource && q.resource.volume) {
@@ -329,36 +382,63 @@ function handleVolumeCommand(message, args) {
 function handleRemoveCommand(message, args) {
   const q = getQueue(message.guild.id);
   if (!q || q.songs.length === 0) {
-    return message.reply("❌ Nothing to remove!");
+    return message.reply("❌ Nothing to remove!").catch(() => {});
   }
   const index = parseInt(args[0]) - 1;
   if (isNaN(index) || index < 0 || index >= q.songs.length) {
-    return message.reply("❌ Invalid song number!");
+    return message.reply("❌ Invalid song number!").catch(() => {});
   }
   const removed = q.songs.splice(index, 1)[0];
+  if (index === 0) {
+    // Current track was removed: advance without letting the Idle
+    // handler shift again (that would drop the next song too).
+    q._advanceMode = "keep";
+    if (q.player) q.player.stop(true);
+    if (q.songs.length === 0) destroyQueue(message.guild.id, q);
+  }
   message.reply(`🗑️ Removed: ${removed.title}`).catch(() => {});
 }
 
 function handleClearCommand(message) {
   const q = getQueue(message.guild.id);
   if (!q || q.songs.length === 0) {
-    return message.reply("❌ Nothing in the queue!");
+    return message.reply("❌ Nothing in the queue!").catch(() => {});
   }
   q.songs = [];
-  if (q.connection) q.connection.destroy();
   queue.delete(message.guild.id);
+  if (q.player) q.player.stop(true);
+  destroyVoice(q);
   message.reply("🗑️ Queue cleared!").catch(() => {});
 }
 
 function handleNowPlayingCommand(message) {
   const q = getQueue(message.guild.id);
-  if (!q || q.songs.length === 0 || !q.player) {
-    return message.reply("❌ Nothing is playing!");
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Nothing is playing!").catch(() => {});
   }
   message.channel.send({ content: `🎵 Now playing: **${q.songs[0].title}**` }).catch(() => {});
 }
 
-const VOICE_COMMANDS = ["play", "stop", "skip", "queue", "loop", "volume", "remove", "clear", "pause", "resume"];
+function handleHelpCommand(message) {
+  const lines = [
+    `**${BOT_NAME} Commands**`,
+    "`!play <url/query>` — Play a YouTube video or search",
+    "`!skip` — Skip the current song",
+    "`!stop` — Stop playback and clear the queue",
+    "`!pause` — Pause playback",
+    "`!resume` — Resume playback",
+    "`!queue` — Show the queue",
+    "`!loop` — Toggle loop mode",
+    "`!volume <0-10>` — Set volume",
+    "`!remove <n>` — Remove a song by number",
+    "`!clear` — Clear the queue",
+    "`!nowplaying` (`!np`) — Show the current song",
+    "`!help` — Show this message",
+  ];
+  message.channel.send({ content: lines.join("\n") }).catch(() => {});
+}
+
+const VOICE_COMMANDS = ["play", "stop", "skip", "loop", "volume", "pause", "resume"];
 
 function handleMessageCreate(message) {
   if (message.author.bot || !message.content.startsWith(PREFIX) || !message.guild) return;
@@ -368,7 +448,7 @@ function handleMessageCreate(message) {
 
   if (!message.member || !message.member.voice || !message.member.voice.channel) {
     if (VOICE_COMMANDS.includes(command)) {
-      return message.reply("❌ You need to be in a voice channel to use this command!");
+      return message.reply("❌ You need to be in a voice channel to use this command!").catch(() => {});
     }
   }
 
@@ -383,17 +463,20 @@ function handleMessageCreate(message) {
     case "volume": handleVolumeCommand(message, args); break;
     case "remove": handleRemoveCommand(message, args); break;
     case "clear": handleClearCommand(message); break;
+    case "help": handleHelpCommand(message); break;
     case "nowplaying":
     case "np": handleNowPlayingCommand(message); break;
-    default: message.reply("❌ Unknown command! Available commands: `play`, `skip`, `stop`, `pause`, `resume`, `queue`, `loop`, `volume`, `remove`, `clear`, `nowplaying`").catch(() => {});
+    default: message.reply("❌ Unknown command! Available commands: `play`, `skip`, `stop`, `pause`, `resume`, `queue`, `loop`, `volume`, `remove`, `clear`, `nowplaying`, `help`").catch(() => {});
   }
 }
 
 function applyPresence() {
   if (!client.isReady()) return;
   try {
-    client.user.setActivity("Music | !play", { type: ActivityType.Listening });
-    client.user.setStatus("online");
+    Promise.resolve(client.user.setActivity("Music | !play", { type: ActivityType.Listening }))
+      .catch((err) => console.error("Presence update failed:", err));
+    Promise.resolve(client.user.setStatus("online"))
+      .catch((err) => console.error("Status update failed:", err));
   } catch (err) {
     console.error("Presence update failed:", err);
   }
@@ -402,6 +485,10 @@ function applyPresence() {
 let loginAttempts = 0;
 
 function login() {
+  if (!TOKEN) {
+    console.error("DISCORD_TOKEN is not set. Add it to your .env file (see .env.example).");
+    return;
+  }
   client.login(TOKEN).catch((err) => {
     console.error("Login failed:", err);
     loginAttempts += 1;
@@ -450,11 +537,21 @@ process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", 
 const app = express();
 const ROOT = path.join(__dirname, "public");
 
+let SESSION_SECRET = process.env.SESSION_SECRET || "";
+if (!SESSION_SECRET) {
+  if (process.env.NODE_ENV === "production") {
+    console.warn("SESSION_SECRET is not set; using an ephemeral secret (sessions reset on restart).");
+    SESSION_SECRET = crypto.randomBytes(32).toString("hex");
+  } else {
+    SESSION_SECRET = "notixmix-dashboard-secret";
+  }
+}
+
 app.set("trust proxy", 1);
 app.use(cookieParser());
 app.use(express.json());
 app.use(session({
-  secret: process.env.SESSION_SECRET || "notixmix-dashboard-secret",
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: { secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 7 * 24 * 60 * 60 * 1000 },
@@ -473,6 +570,12 @@ app.use(express.static(ROOT, { extensions: ["html"] }));
 function getBaseUrl(req) {
   if (BASE_URL) return BASE_URL.replace(/\/$/, "");
   return `${req.protocol}://${req.get("host")}`;
+}
+
+function safeReturnPath(p) {
+  if (typeof p !== "string") return "/dashboard";
+  if (!p.startsWith("/") || p.startsWith("//") || p.includes("\\")) return "/dashboard";
+  return p;
 }
 
 function requireAuth(req, res, next) {
@@ -499,14 +602,19 @@ app.get("/auth/login", (req, res) => {
     return res.status(500).send("DISCORD_CLIENT_SECRET is not configured.");
   }
   const redirect = `${getBaseUrl(req)}/auth/callback`;
-  req.session.returnTo = req.query.return || "/dashboard";
-  const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&scope=identify%20guilds`;
+  const state = crypto.randomBytes(16).toString("hex");
+  req.session.returnTo = safeReturnPath(req.query.return);
+  req.session.oauthState = state;
+  const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&scope=identify%20guilds&state=${state}`;
   res.redirect(url);
 });
 
 app.get("/auth/callback", async (req, res) => {
-  const { code } = req.query;
-  if (!code) return res.redirect("/");
+  const { code, state } = req.query;
+  if (!code || !state || !req.session.oauthState || state !== req.session.oauthState) {
+    return res.redirect("/");
+  }
+  delete req.session.oauthState;
   const redirect = `${getBaseUrl(req)}/auth/callback`;
   try {
     const tokenRes = await new Promise((resolve, reject) => {
@@ -554,9 +662,8 @@ app.get("/auth/callback", async (req, res) => {
         ? `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png?size=64`
         : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(me.id) >> 22n) % 6}.png`,
       guilds: Array.isArray(guilds) ? guilds : [],
-      accessToken: tok.access_token,
     };
-    const back = req.session.returnTo || "/dashboard";
+    const back = safeReturnPath(req.session.returnTo);
     delete req.session.returnTo;
     res.redirect(back);
   } catch (e) {
@@ -635,7 +742,7 @@ app.get("/api/queue/:guildId", requireAuth, (req, res) => {
   });
 });
 
-app.post("/api/control/:guildId/:action", requireAuth, (req, res) => {
+app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
   const { guildId, action } = req.params;
   const inUserGuilds = (req.session.user.guilds || []).some((g) => g.id === guildId);
   if (!inUserGuilds) return res.status(403).json({ error: "Not your server" });
@@ -644,22 +751,25 @@ app.post("/api/control/:guildId/:action", requireAuth, (req, res) => {
   switch (action) {
     case "pause":
       if (!q || !q.player) return res.status(400).json({ error: "Nothing playing" });
-      q.player.pause();
+      if (!q.player.pause()) return res.status(400).json({ error: "Playback is not active right now" });
       break;
     case "resume":
       if (!q || !q.player) return res.status(400).json({ error: "Nothing playing" });
-      q.player.unpause();
+      if (!q.player.unpause()) return res.status(400).json({ error: "Playback is not paused" });
       break;
     case "skip":
-      if (!q || !q.player) return res.status(400).json({ error: "Nothing playing" });
-      q.player.stop();
+      if (!q || !q.player || q.songs.length === 0 || q.player.state.status === AudioPlayerStatus.Idle) {
+        return res.status(400).json({ error: "Nothing playing" });
+      }
+      q._advanceMode = "force";
+      q.player.stop(true);
       break;
     case "stop":
       if (!q) return res.status(400).json({ error: "Nothing playing" });
       q.songs = [];
-      if (q.player) q.player.stop();
-      if (q.connection) q.connection.destroy();
       queue.delete(guildId);
+      if (q.player) q.player.stop(true);
+      destroyVoice(q);
       break;
     case "loop":
       if (!q) return res.status(400).json({ error: "No queue" });
@@ -670,14 +780,19 @@ app.post("/api/control/:guildId/:action", requireAuth, (req, res) => {
       const idx = parseInt(req.body && req.body.index, 10);
       if (isNaN(idx) || idx < 0 || idx >= q.songs.length) return res.status(400).json({ error: "Invalid index" });
       q.songs.splice(idx, 1);
+      if (idx === 0) {
+        q._advanceMode = "keep";
+        if (q.player) q.player.stop(true);
+        if (q.songs.length === 0) destroyQueue(guildId, q);
+      }
       break;
     }
     case "clear":
       if (!q) return res.status(400).json({ error: "No queue" });
       q.songs = [];
-      if (q.player) q.player.stop();
-      if (q.connection) q.connection.destroy();
       queue.delete(guildId);
+      if (q.player) q.player.stop(true);
+      destroyVoice(q);
       break;
     case "volume": {
       if (!q) return res.status(400).json({ error: "No queue" });
@@ -689,8 +804,35 @@ app.post("/api/control/:guildId/:action", requireAuth, (req, res) => {
     }
     case "play": {
       if (!q || q.songs.length === 0) return res.status(400).json({ error: "Queue empty" });
+      if (q.player) {
+        const st = q.player.state.status;
+        if (st === AudioPlayerStatus.Paused) {
+          q.player.unpause();
+          break;
+        }
+        if (st === AudioPlayerStatus.Playing || st === AudioPlayerStatus.Buffering) break;
+      }
       play(guildId).catch(() => {});
       break;
+    }
+    case "add": {
+      if (!q || !q.connection) {
+        return res.status(400).json({ error: "Bot is not in a voice channel here. Use !play in Discord first." });
+      }
+      const query = typeof (req.body && req.body.query) === "string" ? req.body.query.trim() : "";
+      if (!query) return res.status(400).json({ error: "Missing query" });
+      try {
+        const resolved = await resolveVideo(query);
+        const qq = getQueue(guildId);
+        if (!qq) return res.status(400).json({ error: "Queue was cleared while resolving — try again" });
+        qq.songs.push({ url: resolved.url, title: resolved.title });
+        if (qq.player && qq.player.state.status === AudioPlayerStatus.Idle && !qq._starting) {
+          play(guildId).catch(() => {});
+        }
+        return res.json({ ok: true, title: resolved.title });
+      } catch (e) {
+        return res.status(502).json({ error: "Could not find that track" });
+      }
     }
     default:
       return res.status(400).json({ error: "Unknown action" });

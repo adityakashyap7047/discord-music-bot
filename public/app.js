@@ -102,8 +102,8 @@ async function initDashboard() {
   dashView.style.display = "grid";
   if (userSlot) {
     userSlot.innerHTML =
-      '<span class="user-bar"><img src="' + currentUser.avatar + '" alt="" /> <span>' +
-      currentUser.globalName + '</span></span> ' +
+      '<span class="user-bar"><img src="' + escapeHtml(currentUser.avatar) + '" alt="" /> <span>' +
+      escapeHtml(currentUser.globalName) + '</span></span> ' +
       '<a href="/auth/logout" class="btn btn-ghost btn-sm">Logout</a>';
   }
 
@@ -140,13 +140,13 @@ async function loadServers() {
     }
     list.innerHTML = servers.map((s) => {
       const icon = s.icon
-        ? '<img src="' + s.icon + '" alt="" />'
-        : '<div class="fallback">' + s.name.charAt(0).toUpperCase() + "</div>";
+        ? '<img src="' + escapeHtml(s.icon) + '" alt="" />'
+        : '<div class="fallback">' + escapeHtml(s.name.charAt(0).toUpperCase()) + "</div>";
       const badge = s.playing ? '<span class="badge"></span>' : '<span class="badge off"></span>';
       return (
-        '<div class="server-item" data-id="' + s.id + '">' +
+        '<div class="server-item" data-id="' + escapeHtml(s.id) + '">' +
         icon +
-        '<span class="sname">' + s.name + "</span>" +
+        '<span class="sname">' + escapeHtml(s.name) + "</span>" +
         badge +
         "</div>"
       );
@@ -154,6 +154,9 @@ async function loadServers() {
     list.querySelectorAll(".server-item").forEach((el) => {
       el.addEventListener("click", () => selectServer(el.dataset.id, el));
     });
+    if (selectedGuild && !servers.some((s) => s.id === selectedGuild)) {
+      selectedGuild = null;
+    }
     if (!selectedGuild && servers.length > 0) {
       const first = list.querySelector(".server-item");
       if (first) selectServer(first.dataset.id, first);
@@ -247,7 +250,7 @@ function renderControls(data) {
   if (!controls) return;
   const has = !!(data.nowPlaying || (data.queue && data.queue.length));
   controls.style.display = has ? "flex" : "none";
-  volRow.style.display = has ? "flex" : "none";
+  if (volRow) volRow.style.display = has ? "flex" : "none";
   const slider = $("vol-slider");
   const val = $("vol-val");
   if (slider) slider.value = data.volume;
@@ -294,23 +297,23 @@ document.addEventListener("DOMContentLoaded", () => {
     const doPlay = async () => {
       const q = quickInput.value.trim();
       if (!q) { toast("Enter a URL or search", true); return; }
+      if (!selectedGuild) { toast("Select a server first", true); return; }
+      quickBtn.disabled = true;
       quickBtn.textContent = "...";
       try {
-        // Resolve server-side via a lightweight trick: we use the play command path
-        // by posting to a resolve endpoint if present, else inform the user.
-        const r = await fetch("/api/resolve", {
+        await api("/api/control/" + selectedGuild + "/add", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ query: q }),
         });
-        if (r.ok) {
-          toast("Resolved — join a voice channel and use !play in Discord");
-        } else {
-          toast("Use !play in Discord for now", true);
-        }
+        toast("Added to queue ✓");
+        quickInput.value = "";
+        loadQueue(selectedGuild);
+        loadServers();
       } catch (e) {
-        toast("Use !play in Discord", true);
+        if (e.message === "unauthorized") toast("Session expired — please log in again", true);
+        else toast(e.message, true);
       }
+      quickBtn.disabled = false;
       quickBtn.textContent = "▶ Play";
     };
     quickBtn.addEventListener("click", doPlay);
