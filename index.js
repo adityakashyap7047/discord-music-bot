@@ -2,6 +2,7 @@ require("dotenv").config();
 const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
 const ytdl = require("ytdl-core");
+const yts = require("yt-search");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = "!";
@@ -131,11 +132,20 @@ function handlePlayCommand(message, args) {
   }
 
   const command = async () => {
+    const query = args.join(" ");
     let url;
     let title;
-    if (ytdl.validateURL(args.join(" "))) {
+    const getInfo = async (u) => {
+      const info = await ytdl.getInfo(u, {
+        requestOptions: {
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+        },
+      });
+      return info;
+    };
+    if (ytdl.validateURL(query)) {
       try {
-        const info = await ytdl.getInfo(args.join(" "));
+        const info = await getInfo(query);
         url = info.videoDetails.video_url;
         title = info.videoDetails.title;
       } catch (e) {
@@ -143,10 +153,12 @@ function handlePlayCommand(message, args) {
       }
     } else {
       try {
-        const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(args.join(" "))}`;
-        const info = await ytdl.getInfo(searchUrl);
-        url = info.videoDetails.video_url;
-        title = info.videoDetails.title;
+        const searchResults = await yts(query);
+        if (!searchResults.videos || searchResults.videos.length === 0) {
+          return message.reply("❌ Could not find any results!");
+        }
+        url = searchResults.videos[0].url;
+        title = searchResults.videos[0].title;
       } catch (e) {
         return message.reply("❌ Could not find any results!");
       }
