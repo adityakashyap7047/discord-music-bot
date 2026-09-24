@@ -179,7 +179,15 @@ function handlePlayCommand(message, args) {
 
     if (q.songs.length === 1) {
       setupVoiceConnection(guildId, voiceChannel, message);
-      play(guildId);
+      const waitForConnection = async () => {
+        try {
+          await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+          play(guildId).catch(() => {});
+        } catch {
+          play(guildId).catch(() => {});
+        }
+      };
+      waitForConnection().catch(() => {});
     } else {
       textChannel.send({ content: `🎶 Added to queue: **${title}** (${q.songs.length - 1} more in queue)` }).catch(() => {});
     }
