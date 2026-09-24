@@ -135,7 +135,7 @@ async function loadServers() {
     const data = await api("/api/servers");
     const servers = data.servers || [];
     if (servers.length === 0) {
-      list.innerHTML = '<div class="empty">No shared servers found.<br /><a href="https://discord.com/api/oauth2/authorize?client_id=1552647926780534874&permissions=3146240&scope=bot%20applications.commands" style="color:var(--accent2);">Add the bot →</a></div>';
+      list.innerHTML = '<div class="empty">No shared servers where you have manage permissions.<br /><a href="https://discord.com/api/oauth2/authorize?client_id=1552647926780534874&permissions=3146240&scope=bot%20applications.commands" style="color:var(--accent2);">Add the bot →</a></div>';
       return;
     }
     list.innerHTML = servers.map((s) => {

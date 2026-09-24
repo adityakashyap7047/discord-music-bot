@@ -1,5 +1,4 @@
 require("dotenv").config();
-process.env.FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, demuxProbe } = require("@discordjs/voice");
 const { execFile } = require("child_process");
@@ -127,6 +126,27 @@ async function play(guildId) {
   if (q._starting) return;
   q._starting = true;
 
+  if (!q.connection || q.connection.state.status === VoiceConnectionStatus.Destroyed) {
+    q._starting = false;
+    destroyQueue(guildId, q);
+    if (q.textChannel) {
+      q.textChannel.send("❌ Lost the voice connection — stopped playback.").catch(() => {});
+    }
+    return;
+  }
+  try {
+    await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+  } catch {
+    q._starting = false;
+    if (getQueue(guildId) === q) {
+      destroyQueue(guildId, q);
+      if (q.textChannel) {
+        q.textChannel.send("❌ Could not connect to the voice channel — stopped playback.").catch(() => {});
+      }
+    }
+    return;
+  }
+
   const song = q.songs[0];
   let remote = null;
 
@@ -146,6 +166,13 @@ async function play(guildId) {
     if (getQueue(guildId) !== q) {
       if (remote && !remote.destroyed) remote.destroy();
       q._starting = false;
+      return;
+    }
+
+    if (q.songs[0] !== song) {
+      if (remote && !remote.destroyed) remote.destroy();
+      q._starting = false;
+      play(guildId).catch(() => {});
       return;
     }
 
@@ -706,22 +733,27 @@ app.get("/api/me", (req, res) => {
 app.get("/api/servers", requireAuth, (req, res) => {
   const userGuilds = req.session.user.guilds || [];
   const botGuildIds = new Set(client.isReady() ? client.guilds.cache.map((g) => g.id) : []);
-  const mapped = userGuilds.map((g) => {
-    const perms = BigInt(g.permissions || "0");
-    const manage = (perms & 0x20n) === 0x20n || (perms & 0x8n) === 0x8n;
-    const inBot = botGuildIds.has(g.id);
-    const botGuild = inBot ? client.guilds.cache.get(g.id) : null;
-    return {
-      id: g.id,
-      name: g.name,
-      icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=64` : null,
-      owner: !!g.owner,
-      canManage: manage,
-      inBot,
-      members: botGuild ? botGuild.memberCount : null,
-      playing: queue.has(g.id) && queue.get(g.id).songs.length > 0,
-    };
-  });
+  const mapped = userGuilds
+    .filter((g) => {
+      const perms = BigInt(g.permissions || "0");
+      const manage = (perms & 0x20n) === 0x20n || (perms & 0x8n) === 0x8n;
+      return botGuildIds.has(g.id) && (manage || !!g.owner);
+    })
+    .map((g) => {
+      const perms = BigInt(g.permissions || "0");
+      const manage = (perms & 0x20n) === 0x20n || (perms & 0x8n) === 0x8n;
+      const botGuild = client.guilds.cache.get(g.id);
+      return {
+        id: g.id,
+        name: g.name,
+        icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=64` : null,
+        owner: !!g.owner,
+        canManage: manage,
+        inBot: true,
+        members: botGuild ? botGuild.memberCount : null,
+        playing: queue.has(g.id) && queue.get(g.id).songs.length > 0,
+      };
+    });
   res.json({ servers: mapped });
 });
 

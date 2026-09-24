@@ -1,26 +1,24 @@
 services:
   - type: web
     name: discord-music-bot
-    env: node
+    runtime: node
     plan: starter
-    start: npm start
-    setupScript: |
-      sudo apt-get update
-      sudo apt-get install -y ffmpeg
-      curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-      chmod a+rx /usr/local/bin/yt-dlp
+    buildCommand: npm install && curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp && chmod a+rx yt-dlp
+    startCommand: npm start
     envVars:
       - key: PORT
         value: "3000"
+      - key: NODE_VERSION
+        value: "22.12.0"
       - key: DISCORD_TOKEN
-        description: "Your Discord bot token"
+        sync: false
       - key: DISCORD_CLIENT_ID
         value: "1552647926780534874"
       - key: DISCORD_CLIENT_SECRET
-        description: "OAuth2 client secret from Discord Developer Portal"
+        sync: false
       - key: SESSION_SECRET
         generateValue: true
       - key: BASE_URL
-        description: "Public URL of this service, e.g. https://your-app.onrender.com"
-    autoDeploy: true
+        sync: false
+    autoDeployTrigger: commit
     healthCheckPath: /health
