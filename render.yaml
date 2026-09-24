@@ -8,4 +8,7 @@ services:
       - key: DISCORD_TOKEN
         from:
           secret: discord-token
+      - key: PORT
+        value: "3000"
     autoDeploy: true
+    healthCheckPath: /
