@@ -4,6 +4,9 @@ services:
     env: node
     plan: starter
     start: npm start
+    setupScript: |
+      sudo apt-get update
+      sudo apt-get install -y ffmpeg
     envVars:
       - key: DISCORD_TOKEN
         from:
