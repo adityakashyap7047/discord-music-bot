@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType, demuxProbe } = require("@discordjs/voice");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, demuxProbe } = require("@discordjs/voice");
 const ytdl = require("ytdl-core");
 const yts = require("yt-search");
 
@@ -108,13 +108,13 @@ function addSongToQueue(guildId, url, title, textChannel) {
 function setupVoiceConnection(guildId, voiceChannel, message) {
   const q = getQueue(guildId);
   if (!q.voiceChannel) {
-    q.voiceChannel = voiceChannel;
     try {
       q.connection = joinVoiceChannel({
         channelId: voiceChannel.id,
         guildId: guildId,
         adapterCreator: message.guild.voiceAdapterCreator,
       });
+      q.voiceChannel = voiceChannel;
       q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
         try {
           await entersState(q.connection, VoiceConnectionStatus.Signalling, 5000);
