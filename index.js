@@ -131,26 +131,27 @@ function handlePlayCommand(message, args) {
   }
 
   const command = async () => {
-    let url = args.join(" ");
-    if (ytdl.validateURL(url)) {
+    let url;
+    let title;
+    if (ytdl.validateURL(args.join(" "))) {
       try {
-        const info = await ytdl.getInfo(url);
+        const info = await ytdl.getInfo(args.join(" "));
         url = info.videoDetails.video_url;
+        title = info.videoDetails.title;
       } catch (e) {
         return message.reply("❌ Could not fetch video info!");
       }
     } else {
       try {
-        const info = await ytdl.getInfo(url);
-        const video = info.videoDetails;
-        url = video.video_url;
+        const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(args.join(" "))}`;
+        const info = await ytdl.getInfo(searchUrl);
+        url = info.videoDetails.video_url;
+        title = info.videoDetails.title;
       } catch (e) {
         return message.reply("❌ Could not find any results!");
       }
     }
 
-    const info = await ytdl.getInfo(url);
-    const title = info.videoDetails.title;
     const q = addSongToQueue(guildId, url, title, textChannel);
 
     if (q.songs.length === 1) {
