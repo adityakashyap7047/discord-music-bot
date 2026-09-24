@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType, demuxProbe } = require("@discordjs/voice");
 const ytdl = require("ytdl-core");
 const yts = require("yt-search");
 
@@ -37,7 +37,7 @@ function getQueueData(guildId) {
   return { getQueue, createQueue, queue };
 }
 
-function play(guildId) {
+async function play(guildId) {
   const q = getQueue(guildId);
   if (!q || q.songs.length === 0) {
     if (q && q.connection) {
@@ -48,38 +48,49 @@ function play(guildId) {
   }
 
   const song = q.songs[0];
-  const stream = ytdl(song.url, { filter: "audioonly", highWaterMark: 1 << 25 });
-  const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
-  q.resource = resource;
 
-  if (!q.player) {
-    q.player = createAudioPlayer();
-  }
+  try {
+    const stream = ytdl(song.url, { filter: "audioonly", highWaterMark: 1 << 25 });
+    const probe = await demuxProbe(stream);
+    const resource = createAudioResource(probe.stream, {
+      inputType: probe.type,
+      inlineVolume: true,
+    });
+    q.resource = resource;
 
-  q.player.removeAllListeners();
-  q.player.on(AudioPlayerStatus.Idle, () => {
-    if (q.loop) {
-      play(guildId);
-    } else {
+    if (!q.player) {
+      q.player = createAudioPlayer();
+    }
+
+    q.player.removeAllListeners();
+    q.player.on(AudioPlayerStatus.Idle, () => {
+      if (q.loop) {
+        play(guildId);
+      } else {
+        q.songs.shift();
+        play(guildId);
+      }
+    });
+
+    q.player.on(AudioPlayerStatus.Playing, () => {
+      q.textChannel.send({ content: `🎵 Now playing: **${song.title}**` }).catch(() => {});
+    });
+
+    q.player.on("error", (error) => {
+      console.error("Player error:", error);
       q.songs.shift();
       play(guildId);
+    });
+
+    q.connection.subscribe(q.player);
+    q.player.play(resource);
+    if (q.resource && q.resource.volume) {
+      q.resource.volume.setVolume(q.volume / 10);
     }
-  });
-
-  q.player.on(AudioPlayerStatus.Playing, () => {
-    q.textChannel.send({ content: `🎵 Now playing: **${song.title}**` }).catch(() => {});
-  });
-
-  q.player.on("error", (error) => {
-    console.error("Player error:", error);
+  } catch (e) {
+    console.error("Play error:", e);
     q.songs.shift();
     play(guildId);
-  });
-
-  q.connection.subscribe(q.player);
-  q.player.play(resource);
-  if (q.resource && q.resource.volume) {
-    q.resource.volume.setVolume(q.volume / 10);
   }
 }
 
