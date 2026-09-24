@@ -6,8 +6,11 @@ const ytdl = require("ytdl-core");
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = "!";
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages] });
+function createClient() {
+  return new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+}
 
+const client = createClient();
 const queue = new Map();
 
 function getQueue(guildId) {
@@ -23,12 +26,17 @@ function createQueue(guildId) {
     voiceChannel: null,
     connection: null,
     player: null,
+    resource: null,
   };
   queue.set(guildId, q);
   return q;
 }
 
-async function play(guildId) {
+function getQueueData(guildId) {
+  return { getQueue, createQueue, queue };
+}
+
+function play(guildId) {
   const q = getQueue(guildId);
   if (!q || q.songs.length === 0) {
     if (q && q.connection) {
@@ -81,218 +89,227 @@ function addSongToQueue(guildId, url, title, textChannel) {
   return q;
 }
 
-client.on("ready", () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  client.user.setActivity("Music | !play", { type: ActivityType.Listening });
-});
+function setupVoiceConnection(guildId, voiceChannel, message) {
+  const q = getQueue(guildId);
+  if (!q.voiceChannel) {
+    q.voiceChannel = voiceChannel;
+    try {
+      q.connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: guildId,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+      q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+          await entersState(q.connection, VoiceConnectionStatus.Signalling, 5000);
+        } catch {
+          q.connection.destroy();
+          queue.delete(guildId);
+        }
+      });
+      q.connection.on(VoiceConnectionStatus.Signalling, async () => {
+        try {
+          await entersState(q.connection, VoiceConnectionStatus.Ready, 5000);
+        } catch {
+          q.connection.destroy();
+          queue.delete(guildId);
+        }
+      });
+    } catch (e) {
+      console.error(e);
+    }
+  }
+}
 
-client.on("messageCreate", async (message) => {
+function handlePlayCommand(message, args) {
+  const guildId = message.guild.id;
+  const textChannel = message.channel;
+  const voiceChannel = message.member.voice.channel;
+
+  if (!args[0]) {
+    return message.reply("❌ Please provide a YouTube URL or search query!");
+  }
+
+  const command = async () => {
+    let url = args.join(" ");
+    if (ytdl.validateURL(url)) {
+      try {
+        const info = await ytdl.getInfo(url);
+        url = info.videoDetails.video_url;
+      } catch (e) {
+        return message.reply("❌ Could not fetch video info!");
+      }
+    } else {
+      try {
+        const info = await ytdl.getInfo(url);
+        const video = info.videoDetails;
+        url = video.video_url;
+      } catch (e) {
+        return message.reply("❌ Could not find any results!");
+      }
+    }
+
+    const info = await ytdl.getInfo(url);
+    const title = info.videoDetails.title;
+    const q = addSongToQueue(guildId, url, title, textChannel);
+
+    if (q.songs.length === 1) {
+      setupVoiceConnection(guildId, voiceChannel, message);
+      play(guildId);
+    } else {
+      textChannel.send({ content: `🎶 Added to queue: **${title}** (${q.songs.length - 1} more in queue)` }).catch(() => {});
+    }
+  };
+
+  command().catch(() => {});
+}
+
+function handleSkipCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || !q.player) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  q.player.stop();
+  message.reply("⏭️ Skipped!").catch(() => {});
+}
+
+function handleStopCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || !q.player) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  q.songs = [];
+  q.player.stop();
+  if (q.connection) q.connection.destroy();
+  queue.delete(message.guild.id);
+  message.reply("⏹️ Stopped!").catch(() => {});
+}
+
+function handlePauseCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || !q.player) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  q.player.pause();
+  message.reply("⏸️ Paused!").catch(() => {});
+}
+
+function handleResumeCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || !q.player) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  q.player.unpause();
+  message.reply("▶️ Resumed!").catch(() => {});
+}
+
+function handleQueueCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ The queue is empty!");
+  }
+  const list = q.songs.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
+  message.channel.send({ content: `📋 Queue:\n${list}` }).catch(() => {});
+}
+
+function handleLoopCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  q.loop = !q.loop;
+  message.reply(q.loop ? "🔁 Loop enabled!" : "🔁 Loop disabled!").catch(() => {});
+}
+
+function handleVolumeCommand(message, args) {
+  const q = getQueue(message.guild.id);
+  if (!q) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  const vol = parseInt(args[0]);
+  if (isNaN(vol) || vol < 0 || vol > 10) {
+    return message.reply("❌ Volume must be between 0 and 10!");
+  }
+  q.volume = vol;
+  if (q.player && q.resource && q.resource.volume) {
+    q.resource.volume.setVolume(vol / 10);
+  }
+  message.reply(`🔊 Volume set to ${vol}`).catch(() => {});
+}
+
+function handleRemoveCommand(message, args) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Nothing to remove!");
+  }
+  const index = parseInt(args[0]) - 1;
+  if (isNaN(index) || index < 0 || index >= q.songs.length) {
+    return message.reply("❌ Invalid song number!");
+  }
+  const removed = q.songs.splice(index, 1)[0];
+  message.reply(`🗑️ Removed: ${removed.title}`).catch(() => {});
+}
+
+function handleClearCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Nothing in the queue!");
+  }
+  q.songs = [];
+  if (q.connection) q.connection.destroy();
+  queue.delete(message.guild.id);
+  message.reply("🗑️ Queue cleared!").catch(() => {});
+}
+
+function handleNowPlayingCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0 || !q.player) {
+    return message.reply("❌ Nothing is playing!");
+  }
+  message.channel.send({ content: `🎵 Now playing: **${q.songs[0].title}**` }).catch(() => {});
+}
+
+const VOICE_COMMANDS = ["play", "stop", "skip", "queue", "loop", "volume", "remove", "clear", "pause", "resume"];
+
+function handleMessageCreate(message) {
   if (message.author.bot || !message.content.startsWith(PREFIX)) return;
 
   const args = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
   const guildId = message.guild.id;
-  const textChannel = message.channel;
-  const voiceChannel = message.member.voice.channel;
 
-  if (!voiceChannel && ["play", "stop", "skip", "queue", "loop", "volume", "remove", "clear", "pause", "resume"].includes(command)) {
+  if (!message.member.voice.channel && VOICE_COMMANDS.includes(command)) {
     return message.reply("❌ You need to be in a voice channel to use this command!");
   }
 
   switch (command) {
-    case "play": {
-      if (!args[0]) {
-        return message.reply("❌ Please provide a YouTube URL or search query!");
-      }
-
-      let url = args.join(" ");
-      if (ytdl.validateURL(url)) {
-        try {
-          const info = await ytdl.getInfo(url);
-          url = info.videoDetails.video_url;
-        } catch (e) {
-          return message.reply("❌ Could not fetch video info!");
-        }
-      } else {
-        try {
-          const info = await ytdl.getInfo(url);
-          const video = info.videoDetails;
-          url = video.video_url;
-        } catch (e) {
-          return message.reply("❌ Could not find any results!");
-        }
-      }
-
-      const info = await ytdl.getInfo(url);
-      const title = info.videoDetails.title;
-
-      const q = addSongToQueue(guildId, url, title, textChannel);
-
-      if (!q.voiceChannel) {
-        q.voiceChannel = voiceChannel;
-        try {
-          q.connection = joinVoiceChannel({
-            channelId: voiceChannel.id,
-            guildId: guildId,
-            adapterCreator: message.guild.voiceAdapterCreator,
-          });
-          q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
-            try {
-              await entersState(q.connection, VoiceConnectionStatus.Signalling, 5000);
-            } catch {
-              q.connection.destroy();
-              queue.delete(guildId);
-            }
-          });
-          q.connection.on(VoiceConnectionStatus.Signalling, async () => {
-            try {
-              await entersState(q.connection, VoiceConnectionStatus.Ready, 5000);
-            } catch {
-              q.connection.destroy();
-              queue.delete(guildId);
-            }
-          });
-        } catch (e) {
-          console.error(e);
-          return message.reply("❌ Could not join the voice channel!");
-        }
-      }
-
-      if (q.songs.length === 1) {
-        play(guildId);
-      } else {
-        textChannel.send({ content: `🎶 Added to queue: **${title}** (${q.songs.length - 1} more in queue)` }).catch(() => {});
-      }
-      break;
-    }
-
-    case "skip": {
-      const qSkip = getQueue(guildId);
-      if (!qSkip || !qSkip.player) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      qSkip.player.stop();
-      message.reply("⏭️ Skipped!").catch(() => {});
-      break;
-    }
-
-    case "stop": {
-      const qStop = getQueue(guildId);
-      if (!qStop || !qStop.player) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      qStop.songs = [];
-      qStop.player.stop();
-      if (qStop.connection) {
-        qStop.connection.destroy();
-      }
-      queue.delete(guildId);
-      message.reply("⏹️ Stopped!").catch(() => {});
-      break;
-    }
-
-    case "pause": {
-      const qPause = getQueue(guildId);
-      if (!qPause || !qPause.player) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      qPause.player.pause();
-      message.reply("⏸️ Paused!").catch(() => {});
-      break;
-    }
-
-    case "resume": {
-      const qResume = getQueue(guildId);
-      if (!qResume || !qResume.player) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      qResume.player.unpause();
-      message.reply("▶️ Resumed!").catch(() => {});
-      break;
-    }
-
-    case "queue": {
-      const qQue = getQueue(guildId);
-      if (!qQue || qQue.songs.length === 0) {
-        return message.reply("❌ The queue is empty!");
-      }
-      const list = qQue.songs.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
-      textChannel.send({ content: `📋 Queue:\n${list}` }).catch(() => {});
-      break;
-    }
-
-    case "loop": {
-      const qLoop = getQueue(guildId);
-      if (!qLoop || qLoop.songs.length === 0) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      qLoop.loop = !qLoop.loop;
-      message.reply(qLoop.loop ? "🔁 Loop enabled!" : "🔁 Loop disabled!").catch(() => {});
-      break;
-    }
-
-    case "volume": {
-      const qVol = getQueue(guildId);
-      if (!qVol) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      const vol = parseInt(args[0]);
-      if (isNaN(vol) || vol < 0 || vol > 10) {
-        return message.reply("❌ Volume must be between 0 and 10!");
-      }
-      qVol.volume = vol;
-      if (qVol.player && qVol.resource && qVol.resource.volume) {
-        qVol.resource.volume.setVolume(vol / 10);
-      }
-      message.reply(`🔊 Volume set to ${vol}`).catch(() => {});
-      break;
-    }
-
-    case "remove": {
-      const qRem = getQueue(guildId);
-      if (!qRem || qRem.songs.length === 0) {
-        return message.reply("❌ Nothing to remove!");
-      }
-      const index = parseInt(args[0]) - 1;
-      if (isNaN(index) || index < 0 || index >= qRem.songs.length) {
-        return message.reply("❌ Invalid song number!");
-      }
-      const removed = qRem.songs.splice(index, 1)[0];
-      message.reply(`🗑️ Removed: ${removed.title}`).catch(() => {});
-      break;
-    }
-
-    case "clear": {
-      const qClear = getQueue(guildId);
-      if (!qClear || qClear.songs.length === 0) {
-        return message.reply("❌ Nothing in the queue!");
-      }
-      qClear.songs = [];
-      if (qClear.connection) {
-        qClear.connection.destroy();
-      }
-      queue.delete(guildId);
-      message.reply("🗑️ Queue cleared!").catch(() => {});
-      break;
-    }
-
+    case "play": handlePlayCommand(message, args); break;
+    case "skip": handleSkipCommand(message); break;
+    case "stop": handleStopCommand(message); break;
+    case "pause": handlePauseCommand(message); break;
+    case "resume": handleResumeCommand(message); break;
+    case "queue": handleQueueCommand(message); break;
+    case "loop": handleLoopCommand(message); break;
+    case "volume": handleVolumeCommand(message, args); break;
+    case "remove": handleRemoveCommand(message, args); break;
+    case "clear": handleClearCommand(message); break;
     case "nowplaying":
-    case "np": {
-      const qNp = getQueue(guildId);
-      if (!qNp || qNp.songs.length === 0 || !qNp.player) {
-        return message.reply("❌ Nothing is playing!");
-      }
-      const song = qNp.songs[0];
-      textChannel.send({ content: `🎵 Now playing: **${song.title}**` }).catch(() => {});
-      break;
-    }
-
-    default:
-      message.reply("❌ Unknown command! Available commands: `play`, `skip`, `stop`, `pause`, `resume`, `queue`, `loop`, `volume`, `remove`, `clear`, `nowplaying`").catch(() => {});
+    case "np": handleNowPlayingCommand(message); break;
+    default: message.reply("❌ Unknown command! Available commands: `play`, `skip`, `stop`, `pause`, `resume`, `queue`, `loop`, `volume`, `remove`, `clear`, `nowplaying`").catch(() => {});
   }
-});
+}
 
-client.login(TOKEN);
+function startBot() {
+  client.on("ready", () => {
+    console.log(`Logged in as ${client.user.tag}`);
+    client.user.setActivity("Music | !play", { type: ActivityType.Listening });
+  });
+
+  client.on("messageCreate", handleMessageCreate);
+  client.login(TOKEN);
+}
+
+module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue };
 
 const http = require("http");
 const server = http.createServer((req, res) => {
@@ -300,3 +317,5 @@ const server = http.createServer((req, res) => {
   res.end("Bot is running");
 });
 server.listen(process.env.PORT || 3000);
+
+startBot();
