@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, ActivityType } = require("discord.js");
+const { Client, GatewayIntentBits, ActivityType, ApplicationCommandOptionType } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, demuxProbe } = require("@discordjs/voice");
 const { execFile } = require("child_process");
 const https = require("https");
@@ -14,9 +14,23 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID || "1552647926780534874";
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
 const BASE_URL = process.env.BASE_URL || "";
-const PREFIX = "!";
 const BOT_NAME = "NOTIXMIX";
 const START_TIME = Date.now();
+
+const SLASH_COMMANDS = [
+  { name: "play", description: "Play a YouTube video or search query", options: [{ type: ApplicationCommandOptionType.String, name: "query", description: "YouTube URL or search terms", required: true }] },
+  { name: "skip", description: "Skip the current song" },
+  { name: "stop", description: "Stop playback and clear the queue" },
+  { name: "pause", description: "Pause playback" },
+  { name: "resume", description: "Resume playback" },
+  { name: "queue", description: "Show the current queue" },
+  { name: "loop", description: "Toggle loop mode" },
+  { name: "volume", description: "Set the playback volume", options: [{ type: ApplicationCommandOptionType.Integer, name: "level", description: "Volume from 0 to 10", required: true, min_value: 0, max_value: 10 }] },
+  { name: "remove", description: "Remove a song from the queue", options: [{ type: ApplicationCommandOptionType.Integer, name: "number", description: "Queue position (1-based)", required: true, min_value: 1 }] },
+  { name: "clear", description: "Clear the queue" },
+  { name: "nowplaying", description: "Show the currently playing song" },
+  { name: "help", description: "List all commands" },
+];
 
 function resolveYtDlp() {
   if (process.env.YTDLP_PATH && fs.existsSync(process.env.YTDLP_PATH)) return process.env.YTDLP_PATH;
@@ -313,6 +327,7 @@ function handlePlayCommand(message, args) {
     const q = addSongToQueue(guildId, url, title, textChannel);
 
     if (q.songs.length === 1) {
+      message.reply(`🎶 **${title}** — joining voice…`).catch(() => {});
       setupVoiceConnection(guildId, voiceChannel, message);
       const waitForConnection = async () => {
         try {
@@ -393,7 +408,7 @@ function handleQueueCommand(message) {
   const more = q.songs.length > MAX_LINES ? `\n… and ${q.songs.length - MAX_LINES} more` : "";
   let content = `📋 Queue:\n${list}${more}`;
   if (content.length > 1900) content = content.slice(0, 1900) + "\n…";
-  message.channel.send({ content }).catch(() => {});
+  message.reply({ content }).catch(() => {});
 }
 
 function handleLoopCommand(message) {
@@ -458,64 +473,111 @@ function handleNowPlayingCommand(message) {
   if (!q || q.songs.length === 0) {
     return message.reply("❌ Nothing is playing!").catch(() => {});
   }
-  message.channel.send({ content: `🎵 Now playing: **${q.songs[0].title}**` }).catch(() => {});
+  message.reply({ content: `🎵 Now playing: **${q.songs[0].title}**` }).catch(() => {});
 }
 
 function handleHelpCommand(message) {
   const lines = [
     `**${BOT_NAME} Commands**`,
-    "`!play <url/query>` — Play a YouTube video or search",
-    "`!skip` — Skip the current song",
-    "`!stop` — Stop playback and clear the queue",
-    "`!pause` — Pause playback",
-    "`!resume` — Resume playback",
-    "`!queue` — Show the queue",
-    "`!loop` — Toggle loop mode",
-    "`!volume <0-10>` — Set volume",
-    "`!remove <n>` — Remove a song by number",
-    "`!clear` — Clear the queue",
-    "`!nowplaying` (`!np`) — Show the current song",
-    "`!help` — Show this message",
+    "`/play <url/query>` — Play a YouTube video or search",
+    "`/skip` — Skip the current song",
+    "`/stop` — Stop playback and clear the queue",
+    "`/pause` — Pause playback",
+    "`/resume` — Resume playback",
+    "`/queue` — Show the queue",
+    "`/loop` — Toggle loop mode",
+    "`/volume <0-10>` — Set volume",
+    "`/remove <n>` — Remove a song by number",
+    "`/clear` — Clear the queue",
+    "`/nowplaying` — Show the current song",
+    "`/help` — Show this message",
   ];
-  message.channel.send({ content: lines.join("\n") }).catch(() => {});
+  message.reply({ content: lines.join("\n") }).catch(() => {});
 }
 
-const VOICE_COMMANDS = ["play", "stop", "skip", "loop", "volume", "pause", "resume"];
+const VOICE_COMMANDS = new Set(["play", "stop", "skip", "loop", "volume", "pause", "resume"]);
 
-function handleMessageCreate(message) {
-  if (message.author.bot || !message.content.startsWith(PREFIX) || !message.guild) return;
+function interactionCtx(interaction) {
+  let responded = false;
+  const reply = (payload) => {
+    const data = typeof payload === "string" ? { content: payload } : { ...payload };
+    if (interaction.deferred || interaction.replied) {
+      if (!responded) {
+        responded = true;
+        return interaction.editReply(data);
+      }
+      return interaction.followUp(data);
+    }
+    responded = true;
+    return interaction.reply(data);
+  };
+  return {
+    guild: interaction.guild,
+    member: interaction.member,
+    author: interaction.user,
+    reply,
+    channel: {
+      send: (payload) => {
+        const data = typeof payload === "string" ? { content: payload } : payload;
+        if (interaction.channel) return interaction.channel.send(data);
+        return reply(payload);
+      },
+    },
+  };
+}
 
-  const args = message.content.slice(PREFIX.length).trim().split(/ +/);
-  const command = args.shift().toLowerCase();
+async function handleInteraction(interaction) {
+  if (!interaction.isChatInputCommand()) return;
+  const name = interaction.commandName;
 
-  if (!message.member || !message.member.voice || !message.member.voice.channel) {
-    if (VOICE_COMMANDS.includes(command)) {
-      return message.reply("❌ You need to be in a voice channel to use this command!").catch(() => {});
+  if (!interaction.guild) {
+    return interaction.reply({ content: "❌ This command only works in a server.", flags: 64 }).catch(() => {});
+  }
+
+  if (VOICE_COMMANDS.has(name) && !interaction.member?.voice?.channel) {
+    return interaction.reply({ content: "❌ You need to be in a voice channel to use this command!", flags: 64 }).catch(() => {});
+  }
+
+  if (name === "play") {
+    try {
+      await interaction.deferReply();
+    } catch (e) {
+      console.error("deferReply failed:", e);
+      return;
     }
   }
 
-  switch (command) {
-    case "play": handlePlayCommand(message, args); break;
-    case "skip": handleSkipCommand(message); break;
-    case "stop": handleStopCommand(message); break;
-    case "pause": handlePauseCommand(message); break;
-    case "resume": handleResumeCommand(message); break;
-    case "queue": handleQueueCommand(message); break;
-    case "loop": handleLoopCommand(message); break;
-    case "volume": handleVolumeCommand(message, args); break;
-    case "remove": handleRemoveCommand(message, args); break;
-    case "clear": handleClearCommand(message); break;
-    case "help": handleHelpCommand(message); break;
-    case "nowplaying":
-    case "np": handleNowPlayingCommand(message); break;
-    default: message.reply("❌ Unknown command! Available commands: `play`, `skip`, `stop`, `pause`, `resume`, `queue`, `loop`, `volume`, `remove`, `clear`, `nowplaying`, `help`").catch(() => {});
+  const ctx = interactionCtx(interaction);
+
+  try {
+    switch (name) {
+      case "play": handlePlayCommand(ctx, [interaction.options.getString("query", true)]); break;
+      case "skip": handleSkipCommand(ctx); break;
+      case "stop": handleStopCommand(ctx); break;
+      case "pause": handlePauseCommand(ctx); break;
+      case "resume": handleResumeCommand(ctx); break;
+      case "queue": handleQueueCommand(ctx); break;
+      case "loop": handleLoopCommand(ctx); break;
+      case "volume": handleVolumeCommand(ctx, [String(interaction.options.getInteger("level", true))]); break;
+      case "remove": handleRemoveCommand(ctx, [String(interaction.options.getInteger("number", true))]); break;
+      case "clear": handleClearCommand(ctx); break;
+      case "nowplaying": handleNowPlayingCommand(ctx); break;
+      case "help": handleHelpCommand(ctx); break;
+      default:
+        interaction.reply({ content: "❌ Unknown command.", flags: 64 }).catch(() => {});
+    }
+  } catch (e) {
+    console.error("Interaction error:", e);
+    const payload = { content: "❌ Something went wrong running that command.", flags: 64 };
+    if (interaction.deferred || interaction.replied) interaction.followUp(payload).catch(() => {});
+    else interaction.reply(payload).catch(() => {});
   }
 }
 
 function applyPresence() {
   if (!client.isReady()) return;
   try {
-    Promise.resolve(client.user.setActivity("Music | !play", { type: ActivityType.Listening }))
+    Promise.resolve(client.user.setActivity("Music | /play", { type: ActivityType.Listening }))
       .catch((err) => console.error("Presence update failed:", err));
     Promise.resolve(client.user.setStatus("online"))
       .catch((err) => console.error("Status update failed:", err));
@@ -546,10 +608,19 @@ function relogin() {
 }
 
 function startBot() {
-  client.on("ready", () => {
+  client.on("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
     loginAttempts = 0;
     applyPresence();
+    try {
+      await client.application.commands.set(SLASH_COMMANDS);
+      console.log("Global slash commands registered");
+      const guildSets = [...client.guilds.cache.values()].map((g) => g.commands.set(SLASH_COMMANDS));
+      await Promise.all(guildSets);
+      if (guildSets.length) console.log(`Guild slash commands registered for ${guildSets.length} server(s)`);
+    } catch (e) {
+      console.error("Failed to register slash commands:", e);
+    }
   });
 
   client.on("shardReady", () => applyPresence());
@@ -563,7 +634,7 @@ function startBot() {
     relogin();
   });
 
-  client.on("messageCreate", handleMessageCreate);
+  client.on("interactionCreate", handleInteraction);
 
   setInterval(applyPresence, 30 * 60 * 1000);
 
@@ -867,7 +938,7 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
     }
     case "add": {
       if (!q || !q.connection) {
-        return res.status(400).json({ error: "Bot is not in a voice channel here. Use !play in Discord first." });
+        return res.status(400).json({ error: "Bot is not in a voice channel here. Use /play in Discord first." });
       }
       const query = typeof (req.body && req.body.query) === "string" ? req.body.query.trim() : "";
       if (!query) return res.status(400).json({ error: "Missing query" });

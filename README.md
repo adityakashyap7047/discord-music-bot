@@ -53,20 +53,22 @@ npm run dev
 
 ## Commands
 
+Slash commands (type `/` in Discord):
+
 | Command | Description |
 |---------|-------------|
-| `!play <URL/query>` | Play a song |
-| `!skip` | Skip current song |
-| `!stop` | Stop and clear queue |
-| `!pause` | Pause playback |
-| `!resume` | Resume playback |
-| `!queue` | Show queue |
-| `!loop` | Toggle loop |
-| `!volume <0-10>` | Set volume |
-| `!remove <number>` | Remove song from queue |
-| `!clear` | Clear queue |
-| `!nowplaying` / `!np` | Show currently playing |
-| `!help` | List all commands |
+| `/play <URL/query>` | Play a song |
+| `/skip` | Skip current song |
+| `/stop` | Stop and clear queue |
+| `/pause` | Pause playback |
+| `/resume` | Resume playback |
+| `/queue` | Show queue |
+| `/loop` | Toggle loop |
+| `/volume <0-10>` | Set volume |
+| `/remove <number>` | Remove song from queue |
+| `/clear` | Clear queue |
+| `/nowplaying` | Show currently playing |
+| `/help` | List all commands |
 
 ## Deployment (Render)
 
