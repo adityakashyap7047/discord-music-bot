@@ -58,7 +58,17 @@ async function resolveVideo(query, retries = 2) {
   try {
     const json = await runYtDlp(["-J", "--no-playlist", target]);
     const info = JSON.parse(json);
-    if (!info || !info.webpage_url) throw new Error("No results");
+    if (!info) throw new Error("No results");
+
+    if (info._type === "playlist") {
+      const entry = Array.isArray(info.entries) ? info.entries[0] : null;
+      if (!entry) throw new Error("No results");
+      const url = entry.webpage_url || entry.url;
+      if (!url) throw new Error("No results");
+      return { url, title: entry.title || info.title || "Unknown" };
+    }
+
+    if (!info.webpage_url) throw new Error("No results");
     return { url: info.webpage_url, title: info.title || "Unknown" };
   } catch (e) {
     if (retries > 0) {
@@ -70,9 +80,47 @@ async function resolveVideo(query, retries = 2) {
   }
 }
 
-async function getStreamUrl(url) {
-  const out = await runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
-  return out.split(/\r?\n/)[0] || out;
+function describeYtDlpError(msg) {
+  const m = String(msg || "");
+  if (/HTTP Error 429|Too Many Requests|rate.?limit/i.test(m)) {
+    return "YouTube is rate-limiting this server right now — wait a few seconds and try again.";
+  }
+  if (/not a bot/i.test(m)) {
+    return "YouTube is asking for bot verification — wait a minute and try again.";
+  }
+  if (/Private video/i.test(m)) return "That video is private.";
+  if (/age.restricted|Sign in to confirm your age|inappropriate for some users/i.test(m)) {
+    return "That video is age-restricted and can't be played.";
+  }
+  if (/Video unavailable|video has been removed|This video is unavailable/i.test(m)) {
+    return "That video is unavailable or has been removed.";
+  }
+  if (/not available in your country|geo.?restrict/i.test(m)) {
+    return "That video is not available in this region.";
+  }
+  if (/enoent|yt-dlp.*(not found|no such file)|spawn .* ENOENT/i.test(m)) {
+    return "yt-dlp binary not found — set YTDLP_PATH or install yt-dlp.";
+  }
+  if (/timed out|timeout|etimedout|econnreset|network/i.test(m)) {
+    return "Network timeout while contacting YouTube — try again.";
+  }
+  if (/Unsupported URL|no results|not a valid URL/i.test(m)) {
+    return "Couldn't find any results for that URL or query.";
+  }
+  return "Couldn't fetch that track — try again in a few seconds.";
+}
+
+async function getStreamUrl(url, retries = 2) {
+  try {
+    const out = await runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
+    return out.split(/\r?\n/)[0] || out;
+  } catch (e) {
+    if (retries > 0) {
+      await new Promise((r) => setTimeout(r, 1500));
+      return getStreamUrl(url, retries - 1);
+    }
+    throw e;
+  }
 }
 
 function openRemoteStream(url, redirects = 5) {
@@ -233,6 +281,9 @@ async function play(guildId) {
       // flag the advance so the Idle handler drops the broken track
       // even when loop is enabled (and does not advance twice).
       if (!q._advanceMode) q._advanceMode = "force";
+      if (q.textChannel) {
+        q.textChannel.send({ content: `⚠️ Playback error on **${song.title}** — skipping.` }).catch(() => {});
+      }
     });
 
     if (!q.connection || getQueue(guildId) !== q) {
@@ -252,6 +303,9 @@ async function play(guildId) {
     if (getQueue(guildId) !== q) {
       q._starting = false;
       return;
+    }
+    if (q.textChannel) {
+      q.textChannel.send({ content: `⚠️ Skipping **${song.title}** — ${describeYtDlpError(e.message)}` }).catch(() => {});
     }
     if (q.songs[0] === song) q.songs.shift();
     q._advanceMode = null;
@@ -321,7 +375,7 @@ function handlePlayCommand(message, args) {
       title = resolved.title;
     } catch (e) {
       console.error("Play resolve error:", e.message);
-      return message.reply("❌ Couldn't fetch that track (YouTube may be rate-limiting). Please try again in a few seconds.").catch(() => {});
+      return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
     }
 
     const q = addSongToQueue(guildId, url, title, textChannel);
@@ -449,9 +503,14 @@ function handleRemoveCommand(message, args) {
   if (index === 0) {
     // Current track was removed: advance without letting the Idle
     // handler shift again (that would drop the next song too).
-    q._advanceMode = "keep";
+    // stop() emits Idle synchronously, so flag first — but only when the
+    // player is actually active (a no-op stop would leave the flag stale
+    // and make the next song replay instead of advancing).
+    const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
+    if (active) q._advanceMode = "keep";
     if (q.player) q.player.stop(true);
     if (q.songs.length === 0) destroyQueue(message.guild.id, q);
+    else if (!active && !q._starting) play(message.guild.id).catch(() => {});
   }
   message.reply(`🗑️ Removed: ${removed.title}`).catch(() => {});
 }
@@ -495,7 +554,7 @@ function handleHelpCommand(message) {
   message.reply({ content: lines.join("\n") }).catch(() => {});
 }
 
-const VOICE_COMMANDS = new Set(["play", "stop", "skip", "loop", "volume", "pause", "resume"]);
+const VOICE_COMMANDS = new Set(["play", "stop", "skip", "pause", "resume"]);
 
 function interactionCtx(interaction) {
   let responded = false;
@@ -902,9 +961,11 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
       if (isNaN(idx) || idx < 0 || idx >= q.songs.length) return res.status(400).json({ error: "Invalid index" });
       q.songs.splice(idx, 1);
       if (idx === 0) {
-        q._advanceMode = "keep";
+        const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
+        if (active) q._advanceMode = "keep";
         if (q.player) q.player.stop(true);
         if (q.songs.length === 0) destroyQueue(guildId, q);
+        else if (!active && !q._starting) play(guildId).catch(() => {});
       }
       break;
     }
@@ -952,7 +1013,7 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
         }
         return res.json({ ok: true, title: resolved.title });
       } catch (e) {
-        return res.status(502).json({ error: "Could not find that track" });
+        return res.status(502).json({ error: describeYtDlpError(e.message) });
       }
     }
     default:

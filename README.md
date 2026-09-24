@@ -13,7 +13,7 @@ A Discord music bot with a web dashboard, built with discord.js, yt-dlp, and FFm
 - Real-time status API and health endpoint
 
 ## Requirements
-- Node.js 18+
+- Node.js 22.12+
 - A Discord bot token (from the [Discord Developer Portal](https://discord.com/developers/applications))
 - `yt-dlp` (a `yt-dlp.exe` is bundled for Windows; on Linux/macOS install it or set `YTDLP_PATH`)
 - FFmpeg is bundled via `ffmpeg-static` — no system install needed
@@ -72,4 +72,4 @@ Slash commands (type `/` in Discord):
 
 ## Deployment (Render)
 
-The included `render.yaml` deploys the bot + dashboard to Render. It installs FFmpeg and the Linux `yt-dlp` binary automatically. Set `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `BASE_URL` in the service environment.
+The included `render.yaml` deploys the bot + dashboard to Render. The build step installs npm dependencies and downloads the Linux `yt-dlp` binary (FFmpeg comes bundled via `ffmpeg-static`). Set `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `BASE_URL` in the service environment.

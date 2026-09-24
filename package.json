@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "A Discord music bot",
   "main": "index.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
