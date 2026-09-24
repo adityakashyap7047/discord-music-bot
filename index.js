@@ -384,8 +384,12 @@ function handleMessageCreate(message) {
 
 function applyPresence() {
   if (!client.isReady()) return;
-  client.user.setActivity("Music | !play", { type: ActivityType.Listening }).catch(() => {});
-  client.user.setStatus("online").catch(() => {});
+  try {
+    client.user.setActivity("Music | !play", { type: ActivityType.Listening });
+    client.user.setStatus("online");
+  } catch (err) {
+    console.error("Presence update failed:", err);
+  }
 }
 
 let loginAttempts = 0;
