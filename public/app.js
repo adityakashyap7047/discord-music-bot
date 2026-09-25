@@ -197,11 +197,12 @@ function renderNowPlaying(data) {
   }
   const state = data.playerState || "unknown";
   const stateLabel = state === "playing" ? "▶ PLAYING" : state === "paused" ? "⏸ PAUSED" : state.toUpperCase();
+  const npTitle = data.nowPlaying.artist ? data.nowPlaying.title + " — " + data.nowPlaying.artist : data.nowPlaying.title;
   el.innerHTML =
     '<div class="now-playing">' +
     '<div class="np-icon">🎵</div>' +
     '<div class="np-info">' +
-    '<div class="np-title">' + escapeHtml(data.nowPlaying.title) + "</div>" +
+    '<div class="np-title">' + escapeHtml(npTitle) + "</div>" +
     '<div class="np-meta">Volume ' + data.volume + "/10" +
     (data.loop ? " · 🔁 Loop" : "") +
     (data.voiceChannel ? " · 🎙 " + escapeHtml(data.voiceChannel.name) : "") +
@@ -221,13 +222,14 @@ function renderQueue(data) {
     el.innerHTML = '<div class="empty">Queue is empty.</div>';
     return;
   }
-  el.innerHTML = '<div class="queue-list">' + q.map((s, i) =>
-    '<div class="queue-item">' +
-    '<span class="idx">' + (i + 1) + "</span>" +
-    '<span class="qt">' + escapeHtml(s.title) + "</span>" +
-    '<button class="rm" data-idx="' + i + '" title="Remove">✕</button>' +
-    "</div>"
-  ).join("") + "</div>";
+  el.innerHTML = '<div class="queue-list">' + q.map((s, i) => {
+    const label = s.artist ? s.title + " — " + s.artist : s.title;
+    return '<div class="queue-item">' +
+      '<span class="idx">' + (i + 1) + "</span>" +
+      '<span class="qt">' + escapeHtml(label) + "</span>" +
+      '<button class="rm" data-idx="' + i + '" title="Remove">✕</button>' +
+      "</div>";
+  }).join("") + "</div>";
   el.querySelectorAll(".rm").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (!selectedGuild) return;
@@ -301,11 +303,11 @@ document.addEventListener("DOMContentLoaded", () => {
       quickBtn.disabled = true;
       quickBtn.textContent = "...";
       try {
-        await api("/api/control/" + selectedGuild + "/add", {
+        const r = await api("/api/control/" + selectedGuild + "/add", {
           method: "POST",
           body: JSON.stringify({ query: q }),
         });
-        toast("Added to queue ✓");
+        toast(r.count > 1 ? "Added " + r.count + " tracks ✓" : "Added to queue ✓");
         quickInput.value = "";
         loadQueue(selectedGuild);
         loadServers();

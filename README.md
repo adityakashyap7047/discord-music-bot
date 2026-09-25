@@ -4,6 +4,7 @@ A Discord music bot with a web dashboard, built with discord.js, yt-dlp, and FFm
 
 ## Features
 - Play YouTube videos (URL or search query) via yt-dlp
+- Play Spotify links — tracks, albums, and playlists (up to 50 tracks per link)
 - Queue management
 - Skip, stop, pause, resume
 - Volume control
@@ -57,7 +58,7 @@ Slash commands (type `/` in Discord):
 
 | Command | Description |
 |---------|-------------|
-| `/play <URL/query>` | Play a song |
+| `/play <URL/query>` | Play a YouTube video, Spotify track/album/playlist, or search |
 | `/skip` | Skip current song |
 | `/stop` | Stop and clear queue |
 | `/pause` | Pause playback |
@@ -69,6 +70,23 @@ Slash commands (type `/` in Discord):
 | `/clear` | Clear queue |
 | `/nowplaying` | Show currently playing |
 | `/help` | List all commands |
+
+## Spotify
+
+Paste any Spotify link into `/play` (or the dashboard's quick-play box):
+
+```
+/play https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT
+/play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M
+/play spotify:track:4cOdK2wGLETKBW3PvgPWqT
+```
+
+How it works:
+
+- Track metadata (title, artist, playlist contents) is read from Spotify's public embed pages — **no Spotify API key or Premium account required**.
+- Spotify doesn't expose audio streams to bots, so each track is matched against YouTube via yt-dlp and streamed from there.
+- Playlists/albums queue up to 50 tracks instantly; each track is resolved to its YouTube match lazily, right before it plays.
+- Podcasts (`episode`/`show` links) are not supported.
 
 ## Deployment (Render)
 

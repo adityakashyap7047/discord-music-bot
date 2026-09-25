@@ -117,7 +117,7 @@ const guildPlayCooldowns = new Map();     // guildId -> timestamp of last /play
 const PLAY_COOLDOWN_MS = 3000;            // 3 seconds between /play per guild
 
 const SLASH_COMMANDS = [
-  { name: "play", description: "Play a YouTube video or search query", options: [{ type: ApplicationCommandOptionType.String, name: "query", description: "YouTube URL or search terms", required: true }] },
+  { name: "play", description: "Play a YouTube video, Spotify track/playlist, or search query", options: [{ type: ApplicationCommandOptionType.String, name: "query", description: "YouTube URL, Spotify link, or search terms", required: true }] },
   { name: "skip", description: "Skip the current song" },
   { name: "stop", description: "Stop playback and clear the queue" },
   { name: "pause", description: "Pause playback" },
@@ -634,7 +634,7 @@ async function handlePlayCommand(message, args) {
   }
 
   if (!args[0]) {
-    return message.reply("❌ Please provide a YouTube URL or search query!").catch(() => {});
+    return message.reply("❌ Please provide a YouTube URL, Spotify link, or search query!").catch(() => {});
   }
 
   // Per-guild cooldown to prevent spamming /play
@@ -647,21 +647,50 @@ async function handlePlayCommand(message, args) {
   guildPlayCooldowns.set(guildId, now);
 
   const query = args.join(" ");
-  let url;
-  let title;
-  try {
-    const resolved = await resolveVideo(query);
-    url = resolved.url;
-    title = resolved.title;
-  } catch (e) {
-    console.error("Play resolve error:", e.message);
-    return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
+  const spotify = isSpotifyLink(query);
+  let songs;
+  let container = null;
+
+  if (spotify) {
+    let sp;
+    try {
+      sp = await resolveSpotify(query);
+    } catch (e) {
+      console.error("Spotify resolve error:", e.message);
+      return message.reply("❌ " + e.message).catch(() => {});
+    }
+    container = sp.title;
+    songs = sp.tracks.map((t) => ({
+      url: null,
+      title: t.title,
+      artist: t.artist,
+      search: spotifySearchQuery(t),
+      source: "spotify",
+    }));
+    if (sp.total > sp.tracks.length) {
+      container = `${sp.title} (first ${sp.tracks.length} of ${sp.total})`;
+    }
+  } else {
+    try {
+      const resolved = await resolveVideo(query);
+      songs = [{ url: resolved.url, title: resolved.title, source: "youtube" }];
+    } catch (e) {
+      console.error("Play resolve error:", e.message);
+      return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
+    }
   }
 
-  const q = addSongToQueue(guildId, url, title, textChannel);
+  const existing = getQueue(guildId);
+  const wasEmpty = !existing || existing.songs.length === 0;
+  const q = addSongToQueue(guildId, songs, textChannel);
+  const first = songs[0];
 
-  if (q.songs.length === 1) {
-    message.reply(`🎶 **${title}** — joining voice…`).catch(() => {});
+  if (wasEmpty) {
+    message.reply(
+      songs.length > 1
+        ? `🎶 Queued **${songs.length}** tracks from **${container}** — joining voice…`
+        : `🎶 **${first.title}** — joining voice…`
+    ).catch(() => {});
     setupVoiceConnection(guildId, voiceChannel, message);
     try {
       if (!q.connection) {
@@ -676,8 +705,10 @@ async function handlePlayCommand(message, args) {
       queue.delete(guildId);
       message.reply("❌ Could not join voice channel!").catch(() => {});
     }
+  } else if (songs.length > 1) {
+    safeSend(textChannel, { content: `🎶 Added **${songs.length}** tracks from **${container}** (${q.songs.length - songs.length} already in queue)` });
   } else {
-    safeSend(textChannel, { content: `🎶 Added to queue: **${title}** (${q.songs.length - 1} more in queue)` });
+    safeSend(textChannel, { content: `🎶 Added to queue: **${first.title}** (${q.songs.length - 1} more in queue)` });
   }
 }
 
@@ -815,7 +846,7 @@ function handleNowPlayingCommand(message) {
 function handleHelpCommand(message) {
   const lines = [
     `**${BOT_NAME} Commands**`,
-    "`/play <url/query>` — Play a YouTube video or search",
+    "`/play <url/query>` — Play YouTube, Spotify (track/album/playlist), or search",
     "`/skip` — Skip the current song",
     "`/stop` — Stop playback and clear the queue",
     "`/pause` — Pause playback",
@@ -1194,7 +1225,7 @@ app.get("/api/queue/:guildId", requireAuth, (req, res) => {
   if (!q) return res.json({ queue: [], nowPlaying: null, volume: 5, loop: false, voiceChannel: null });
   const nowPlaying = q.songs[0] || null;
   res.json({
-    queue: q.songs.map((s, i) => ({ index: i, title: s.title, url: s.url })),
+    queue: q.songs.map((s, i) => ({ index: i, title: s.title, artist: s.artist || null, source: s.source || "youtube", url: s.url || null })),
     nowPlaying,
     volume: q.volume,
     loop: q.loop,
@@ -1285,17 +1316,34 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
       }
       const query = typeof (req.body && req.body.query) === "string" ? req.body.query.trim() : "";
       if (!query) return res.status(400).json({ error: "Missing query" });
+      const spotify = isSpotifyLink(query);
       try {
-        const resolved = await resolveVideo(query);
+        let entries;
+        let label = query;
+        if (spotify) {
+          const sp = await resolveSpotify(query);
+          label = sp.title;
+          entries = sp.tracks.map((t) => ({
+            url: null,
+            title: t.title,
+            artist: t.artist,
+            search: spotifySearchQuery(t),
+            source: "spotify",
+          }));
+        } else {
+          const resolved = await resolveVideo(query);
+          label = resolved.title;
+          entries = [{ url: resolved.url, title: resolved.title, source: "youtube" }];
+        }
         const qq = getQueue(guildId);
         if (!qq) return res.status(400).json({ error: "Queue was cleared while resolving — try again" });
-        qq.songs.push({ url: resolved.url, title: resolved.title });
+        for (const entry of entries) qq.songs.push(entry);
         if (qq.player && qq.player.state.status === AudioPlayerStatus.Idle && !qq._starting) {
           play(guildId).catch(() => {});
         }
-        return res.json({ ok: true, title: resolved.title });
+        return res.json({ ok: true, title: label, count: entries.length });
       } catch (e) {
-        return res.status(502).json({ error: describeYtDlpError(e.message) });
+        return res.status(502).json({ error: spotify ? e.message : describeYtDlpError(e.message) });
       }
     }
     default:
@@ -1323,6 +1371,6 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Dashboard running on port ${PORT}`));
 
-module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue, app, client };
+module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue, resolveSpotify, isSpotifyLink, spotifySearchQuery, app, client };
 
 startBot();
