@@ -34,14 +34,16 @@
         <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
           <span class="arrow">▶</span>
           <h3>🎵 Playback</h3>
-          <span class="count">6 commands</span>
+          <span class="count">8 commands</span>
         </div>
         <div class="cmd-list">
           <div class="cmd-row"><span class="name">play</span><code>/play &lt;url/query&gt;</code><code>Play YouTube, Spotify (track/album/playlist), or search</code></div>
           <div class="cmd-row"><span class="name">skip</span><code>/skip</code><code>Skip current song</code></div>
+          <div class="cmd-row"><span class="name">previous</span><code>/previous</code><code>Play the previous song</code></div>
           <div class="cmd-row"><span class="name">stop</span><code>/stop</code><code>Stop and clear queue</code></div>
           <div class="cmd-row"><span class="name">pause</span><code>/pause</code><code>Pause playback</code></div>
           <div class="cmd-row"><span class="name">resume</span><code>/resume</code><code>Resume playback</code></div>
+          <div class="cmd-row"><span class="name">shuffle</span><code>/shuffle</code><code>Shuffle the queue</code></div>
           <div class="cmd-row"><span class="name">nowplaying</span><code>/nowplaying</code><code>Show current song</code></div>
         </div>
       </div>
@@ -53,7 +55,7 @@
           <span class="count">4 commands</span>
         </div>
         <div class="cmd-list">
-          <div class="cmd-row"><span class="name">queue</span><code>/queue</code><code>Show the full queue</code></div>
+          <div class="cmd-row"><span class="name">queue</span><code>/queue</code><code>Show the queue (paginated)</code></div>
           <div class="cmd-row"><span class="name">loop</span><code>/loop</code><code>Toggle loop mode</code></div>
           <div class="cmd-row"><span class="name">remove</span><code>/remove &lt;n&gt;</code><code>Remove song by number</code></div>
           <div class="cmd-row"><span class="name">clear</span><code>/clear</code><code>Clear the queue</code></div>
@@ -64,10 +66,25 @@
         <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
           <span class="arrow">▶</span>
           <h3>🔊 Audio</h3>
-          <span class="count">1 command</span>
+          <span class="count">4 commands</span>
         </div>
         <div class="cmd-list">
           <div class="cmd-row"><span class="name">volume</span><code>/volume &lt;0-10&gt;</code><code>Set playback volume</code></div>
+          <div class="cmd-row"><span class="name">lyric</span><code>/lyric</code><code>Lyrics for the current song</code></div>
+          <div class="cmd-row"><span class="name">join</span><code>/join</code><code>Join your voice channel</code></div>
+          <div class="cmd-row"><span class="name">leave</span><code>/leave</code><code>Leave voice (Manage Server)</code></div>
+        </div>
+      </div>
+
+      <div class="cmd-group open">
+        <div class="cmd-group-head" onclick="this.parentElement.classList.toggle('open')">
+          <span class="arrow">▶</span>
+          <h3>⚙️ Settings</h3>
+          <span class="count">2 commands</span>
+        </div>
+        <div class="cmd-list">
+          <div class="cmd-row"><span class="name">247</span><code>/247</code><code>Stay in voice when idle (Manage Server)</code></div>
+          <div class="cmd-row"><span class="name">autoplay</span><code>/autoplay</code><code>Auto-queue similar tracks when the queue empties</code></div>
         </div>
       </div>
 
