@@ -130,5 +130,5 @@ The included `render.yaml` deploys the bot + dashboard to Render. The build step
 Notes:
 
 - The blueprint targets the **Free** plan and declares no disks — disks are a paid-plan feature and would make the deploy fail.
-- Set `KEEP_ALIVE_URL` to the service's own URL (e.g. `https://<your-app>.onrender.com/health`). The bot pings it every 10 minutes so the free instance never sleeps; a sleeping instance drops the Discord gateway and every slash command answers *"The application did not respond"* until something wakes the service.
+- `KEEP_ALIVE_URL` is pre-filled with this service's own URL (`https://discord-music-bot-rhed.onrender.com/health`). The bot pings it every 10 minutes so the free instance never sleeps; a sleeping instance drops the Discord gateway and every slash command answers *"The application did not respond"* until something wakes the service.
 - `autoDeployTrigger: commit` redeploys on every push to `master`. GitHub shows no build status for this repo, so if the Render dashboard shows no new deployment after a push, run **Manual Deploy → Clear build cache & deploy** once and check that the repo is actually connected under *Settings → Source*.

@@ -35,11 +35,9 @@ services:
       # when YouTube bot-checks, playback falls back to SoundCloud instead.
       - key: YTDLP_COOKIES
         sync: false
-      # Set this in the dashboard to your own service URL (e.g.
-      # https://discord-music-bot-xxxx.onrender.com/health) so the free instance
-      # is pinged every 10 minutes and does not sleep (a sleeping instance drops
-      # the Discord gateway and every slash command times out).
+      # Pinged every 10 minutes so the free instance does not sleep (a sleeping
+      # instance drops the Discord gateway and every slash command times out).
       - key: KEEP_ALIVE_URL
-        sync: false
+        value: "https://discord-music-bot-rhed.onrender.com/health"
     autoDeployTrigger: commit
     healthCheckPath: /health
