@@ -2,7 +2,7 @@ services:
   - type: web
     name: discord-music-bot
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: |
       npm install &&
       apt-get update && apt-get install -y --no-install-recommends ffmpeg &&
@@ -30,14 +30,16 @@ services:
         sync: false
       - key: SPOTIFY_CLIENT_SECRET
         sync: false
-      # Points at the persistent disk below. If cookies.txt is not uploaded
-      # yet, yt-dlp simply runs without cookies (the path is only used when
-      # the file exists).
+      # Optional. The free plan has no persistent disk, so only set this if you
+      # have a cookies.txt somewhere in the repo/deploy. It is not required:
+      # when YouTube bot-checks, playback falls back to SoundCloud instead.
       - key: YTDLP_COOKIES
-        value: "/var/data/cookies.txt"
-    disks:
-      - name: yt-cookies
-        mountPath: /var/data
-        sizeGB: 1
+        sync: false
+      # Set this in the dashboard to your own service URL (e.g.
+      # https://discord-music-bot-xxxx.onrender.com/health) so the free instance
+      # is pinged every 10 minutes and does not sleep (a sleeping instance drops
+      # the Discord gateway and every slash command times out).
+      - key: KEEP_ALIVE_URL
+        sync: false
     autoDeployTrigger: commit
     healthCheckPath: /health

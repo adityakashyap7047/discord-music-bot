@@ -1,7 +1,7 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits, ActivityType, ApplicationCommandOptionType } = require("discord.js");
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, demuxProbe } = require("@discordjs/voice");
-const { execFile } = require("child_process");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
+const { execFile, spawn } = require("child_process");
 const https = require("https");
 const path = require("path");
 const fs = require("fs");
@@ -223,12 +223,14 @@ function ytClientArgs(client) {
 // Tries the default client first, then each fallback client while YouTube
 // keeps returning bot-check / rate-limit errors. Non-transient errors
 // (private video, bad URL, ...) are thrown immediately.
+// Resolves with { out, client } so the caller can reuse the client that worked.
 async function withYtClients(args, timeout = 30000, runner = runYtDlp) {
   const clients = [null, ...resolveYtClients()];
   let lastErr = null;
   for (let i = 0; i < clients.length; i++) {
     try {
-      return await runner([...args, ...ytClientArgs(clients[i])], timeout);
+      const out = await runner([...args, ...ytClientArgs(clients[i])], timeout);
+      return { out, client: clients[i] };
     } catch (e) {
       lastErr = e;
       if (!isTransientYtError(e.message)) throw e;
@@ -242,24 +244,55 @@ function isYouTubeUrl(s) {
   return /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(s);
 }
 
+function isSoundCloudUrl(s) {
+  return /^https?:\/\/(www\.)?soundcloud\.com\/\S+/i.test(String(s || "").trim());
+}
+
+// Turns yt-dlp's JSON dump (single entry or a 1-entry search result) into { url, title }.
+function parseYtDlpInfo(json) {
+  const info = JSON.parse(json);
+  if (!info) throw new Error("No results");
+
+  if (info._type === "playlist") {
+    const entry = Array.isArray(info.entries) ? info.entries[0] : null;
+    if (!entry) throw new Error("No results");
+    const url = entry.webpage_url || entry.url;
+    if (!url) throw new Error("No results");
+    return { url, title: entry.title || info.title || "Unknown" };
+  }
+
+  if (!info.webpage_url) throw new Error("No results");
+  return { url: info.webpage_url, title: info.title || "Unknown" };
+}
+
+// SoundCloud has no "not a bot" checks, so it doubles as a free fallback
+// source when YouTube blocks this server's IP.
+async function resolveSoundCloud(query) {
+  const json = await runYtDlp(["-J", "--no-playlist", `scsearch1:${query}`]);
+  const parsed = parseYtDlpInfo(json);
+  return { ...parsed, source: "soundcloud", client: null };
+}
+
 async function resolveVideo(query, retries = 2) {
-  const target = isYouTubeUrl(query) ? query : `ytsearch1:${query}`;
+  const q = String(query || "").trim();
+  const isYtUrl = isYouTubeUrl(q);
+  const isScUrl = isSoundCloudUrl(q);
+  const target = isYtUrl || isScUrl ? q : `ytsearch1:${q}`;
   try {
-    const json = await withYtClients(["-J", "--no-playlist", target]);
-    const info = JSON.parse(json);
-    if (!info) throw new Error("No results");
-
-    if (info._type === "playlist") {
-      const entry = Array.isArray(info.entries) ? info.entries[0] : null;
-      if (!entry) throw new Error("No results");
-      const url = entry.webpage_url || entry.url;
-      if (!url) throw new Error("No results");
-      return { url, title: entry.title || info.title || "Unknown" };
-    }
-
-    if (!info.webpage_url) throw new Error("No results");
-    return { url: info.webpage_url, title: info.title || "Unknown" };
+    const { out, client } = await withYtClients(["-J", "--no-playlist", target]);
+    const parsed = parseYtDlpInfo(out);
+    return { ...parsed, source: isScUrl ? "soundcloud" : "youtube", client };
   } catch (e) {
+    // YouTube bot-check on a search query → retry against SoundCloud, which
+    // never asks for bot verification (only worth trying for search terms).
+    if (!isYtUrl && !isScUrl && isTransientYtError(e.message)) {
+      try {
+        console.warn(`YouTube blocked the search (${e.message.split("\n")[0]}) — falling back to SoundCloud`);
+        return await resolveSoundCloud(q);
+      } catch (scErr) {
+        console.error("SoundCloud fallback failed:", scErr.message);
+      }
+    }
     if (retries > 0) {
       await new Promise((r) => setTimeout(r, 1500));
       return resolveVideo(query, retries - 1);
@@ -275,7 +308,7 @@ function describeYtDlpError(msg) {
     return "YouTube is rate-limiting this server right now — wait a few seconds and try again.";
   }
   if (/not a bot/i.test(m)) {
-    return "YouTube is asking for bot verification on this server's IP — it usually clears in a minute. If it keeps happening, set YTDLP_COOKIES in .env to a cookies.txt exported from a logged-in browser.";
+    return "YouTube is asking for bot verification on this server's IP — it usually clears in a minute. Searches automatically retry on SoundCloud; paste a SoundCloud link to play now, or set YTDLP_COOKIES in .env to a cookies.txt exported from a logged-in browser.";
   }
   if (/Private video/i.test(m)) return "That video is private.";
   if (/age.restricted|Sign in to confirm your age|inappropriate for some users/i.test(m)) {
@@ -286,6 +319,9 @@ function describeYtDlpError(msg) {
   }
   if (/not available in your country|geo.?restrict/i.test(m)) {
     return "That video is not available in this region.";
+  }
+  if (/spawn ffmpeg|ffmpeg.*(not found|no such file)/i.test(m)) {
+    return "FFmpeg not found — reinstall dependencies (npm install) or add ffmpeg to PATH.";
   }
   if (/enoent|yt-dlp.*(not found|no such file)|spawn .* ENOENT/i.test(m)) {
     return "yt-dlp binary not found — set YTDLP_PATH or install yt-dlp.";
@@ -547,7 +583,7 @@ async function resolveSpotify(input) {
 
 async function getStreamUrl(url, retries = 2) {
   try {
-    const out = await withYtClients(["-f", "bestaudio/best", "--get-url", url], 45000);
+    const { out } = await withYtClients(["-f", "bestaudio/best", "--get-url", url], 45000);
     return out.split(/\r?\n/)[0] || out;
   } catch (e) {
     if (retries > 0) {
@@ -560,25 +596,86 @@ async function getStreamUrl(url, retries = 2) {
   }
 }
 
-function openRemoteStream(url, redirects = 5) {
-  return new Promise((resolve, reject) => {
-    if (redirects <= 0) return reject(new Error("Too many redirects"));
-    const lib = url.startsWith("http:") ? require("http") : https;
-    const req = lib.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        const next = new URL(res.headers.location, url).toString();
-        return openRemoteStream(next, redirects - 1).then(resolve, reject);
-      }
-      if (res.statusCode !== 200 && res.statusCode !== 206) {
-        res.resume();
-        return reject(new Error(`HTTP ${res.statusCode}`));
-      }
-      resolve(res);
-    });
-    req.on("error", reject);
-    req.setTimeout(30000, () => { req.destroy(new Error("Stream timeout")); });
+// ---------------------------------------------------------------------------
+// Playback: yt-dlp -> ffmpeg -> PCM -> AudioResource
+// The previous path fetched a direct stream URL and piped it into demuxProbe.
+// Those URLs are IP-bound, expire, and carry no retry, so any hiccup silently
+// killed the track. Spawning yt-dlp keeps its retries/range requests in charge
+// of the whole transfer, and ffmpeg (bundled via ffmpeg-static) decodes every
+// container YouTube or SoundCloud can hand back, including HLS.
+// ---------------------------------------------------------------------------
+let FFMPEG_BIN = null;
+function resolveFfmpeg() {
+  if (FFMPEG_BIN) return FFMPEG_BIN;
+  try {
+    const p = require("ffmpeg-static");
+    const v = (p && p.path) || p;
+    if (typeof v === "string" && v && fs.existsSync(v)) FFMPEG_BIN = v;
+  } catch { /* fall through to PATH lookup */ }
+  if (!FFMPEG_BIN) FFMPEG_BIN = "ffmpeg";
+  return FFMPEG_BIN;
+}
+
+function stopPipe(pipe) {
+  if (!pipe) return;
+  try { if (pipe.ytdlp && !pipe.ytdlp.killed) pipe.ytdlp.kill(); } catch { /* already gone */ }
+  try { if (pipe.ffmpeg && !pipe.ffmpeg.killed) pipe.ffmpeg.kill(); } catch { /* already gone */ }
+}
+
+// Spawns yt-dlp writing audio to stdout, piped through ffmpeg into raw PCM
+// (48kHz stereo) that @discordjs/voice encodes to opus. `started` resolves once
+// audio actually flows, so a failed extraction surfaces as an error we can
+// report instead of leaving the channel in silence.
+function createPipedResource(song) {
+  const ytdlp = spawn(YTDLP, [
+    "--no-warnings",
+    ...ytCookieArgs(),
+    "-f", "bestaudio/best",
+    "--no-playlist",
+    "-o", "-",
+    ...ytClientArgs(song.client || null),
+    song.url,
+  ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+
+  let stderr = "";
+  ytdlp.stderr.on("data", (d) => { stderr = (stderr + d.toString()).slice(-4000); });
+
+  const ffmpeg = spawn(resolveFfmpeg(), [
+    "-hide_banner", "-loglevel", "error", "-nostdin",
+    "-i", "pipe:0", "-vn",
+    "-f", "s16le", "-ar", "48000", "-ac", "2",
+    "pipe:1",
+  ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+
+  // EPIPE is normal whenever yt-dlp finishes or dies before ffmpeg does.
+  ffmpeg.stdin.on("error", () => {});
+  ytdlp.stdout.pipe(ffmpeg.stdin);
+
+  const resource = createAudioResource(ffmpeg.stdout, {
+    inputType: StreamType.Raw,
+    inlineVolume: true,
   });
+
+  const started = new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    const timer = setTimeout(() => finish(reject, new Error("Timed out starting the stream")), 45000);
+    ffmpeg.stdout.once("data", () => finish(resolve));
+    ytdlp.once("error", (e) => finish(reject, e));
+    ffmpeg.once("error", (e) => finish(reject, e));
+    ytdlp.once("exit", (code) => {
+      // Exit code 0 just means yt-dlp finished writing — ffmpeg may still be
+      // draining, so only a real failure counts as an error here.
+      if (code !== 0) finish(reject, new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+    });
+  });
+
+  return { ytdlp, ffmpeg, resource, started };
 }
 
 function createClient() {
@@ -611,6 +708,12 @@ function createQueue(guildId) {
 }
 
 function destroyVoice(q) {
+  try {
+    stopPipe(q && q._pipe);
+    if (q) q._pipe = null;
+  } catch (e) {
+    console.error("Pipe destroy failed:", e);
+  }
   try {
     if (q && q.connection && q.connection.state && q.connection.state.status !== "destroyed") {
       q.connection.destroy();
@@ -656,11 +759,11 @@ async function play(guildId) {
   }
 
   const song = q.songs[0];
-  let remote = null;
+  let pipe = null;
 
   try {
-    // Spotify tracks are queued without a stream URL — resolve the YouTube
-    // match lazily right before playback so big playlists load instantly.
+    // Spotify tracks are queued without a stream URL — resolve the match
+    // lazily right before playback so big playlists load instantly.
     if (!song.url) {
       const resolved = await resolveVideo(song.search || song.title);
       if (getQueue(guildId) !== q) {
@@ -673,34 +776,37 @@ async function play(guildId) {
         return;
       }
       song.url = resolved.url;
+      song.client = resolved.client;
+      song.source = resolved.source || song.source;
     }
 
-    const streamUrl = await getStreamUrl(song.url);
-    if (getQueue(guildId) !== q) {
-      q._starting = false;
-      return;
+    // yt-dlp -> ffmpeg -> PCM. `started` only resolves once audio flows, so a
+    // bot-check or bad URL throws into the catch below and skips the track.
+    pipe = createPipedResource(song);
+    try {
+      await pipe.started;
+    } catch (e) {
+      stopPipe(pipe);
+      pipe = null;
+      throw e;
     }
-    remote = await openRemoteStream(streamUrl);
-    const probe = await demuxProbe(remote);
-    const resource = createAudioResource(probe.stream, {
-      inputType: probe.type,
-      inlineVolume: true,
-    });
 
     if (getQueue(guildId) !== q) {
-      if (remote && !remote.destroyed) remote.destroy();
+      stopPipe(pipe);
       q._starting = false;
       return;
     }
 
     if (q.songs[0] !== song) {
-      if (remote && !remote.destroyed) remote.destroy();
+      stopPipe(pipe);
       q._starting = false;
       play(guildId).catch(() => {});
       return;
     }
 
-    q.resource = resource;
+    stopPipe(q._pipe); // tear down the previous track's processes
+    q._pipe = pipe;
+    q.resource = pipe.resource;
 
     if (!q.player) {
       q.player = createAudioPlayer();
@@ -708,6 +814,8 @@ async function play(guildId) {
 
     q.player.removeAllListeners();
     q.player.on(AudioPlayerStatus.Idle, () => {
+      stopPipe(q._pipe);
+      q._pipe = null;
       const mode = q._advanceMode;
       q._advanceMode = null;
       if (mode === "keep") {
@@ -724,7 +832,8 @@ async function play(guildId) {
       if (!q._announceNext) return;
       q._announceNext = false;
       if (q.textChannel) {
-        safeSend(q.textChannel, { content: `🎵 Now playing: **${song.title}**` });
+        const label = song.source === "soundcloud" ? `**${song.title}** _(SoundCloud)_` : `**${song.title}**`;
+        safeSend(q.textChannel, { content: `🎵 Now playing: ${label}` });
       }
     });
 
@@ -740,19 +849,20 @@ async function play(guildId) {
     });
 
     if (!q.connection || getQueue(guildId) !== q) {
-      if (remote && !remote.destroyed) remote.destroy();
+      stopPipe(pipe);
       q._starting = false;
       return;
     }
     q._announceNext = true;
     q.connection.subscribe(q.player);
-    q.player.play(resource);
+    q.player.play(pipe.resource);
     if (q.resource && q.resource.volume) {
       q.resource.volume.setVolume(q.volume / 10);
     }
   } catch (e) {
     console.error("Play error:", e);
-    if (remote && !remote.destroyed) remote.destroy();
+    stopPipe(pipe);
+    if (q._pipe === pipe) q._pipe = null;
     if (getQueue(guildId) !== q) {
       q._starting = false;
       return;
@@ -815,7 +925,7 @@ async function handlePlayCommand(message, args) {
   }
 
   if (!args[0]) {
-    return message.reply("❌ Please provide a YouTube URL, Spotify link, or search query!").catch(() => {});
+    return message.reply("❌ Please provide a YouTube URL, SoundCloud link, Spotify link, or search query!").catch(() => {});
   }
 
   // Per-guild cooldown to prevent spamming /play
@@ -854,7 +964,7 @@ async function handlePlayCommand(message, args) {
   } else {
     try {
       const resolved = await resolveVideo(query);
-      songs = [{ url: resolved.url, title: resolved.title, source: "youtube" }];
+      songs = [{ url: resolved.url, title: resolved.title, source: resolved.source || "youtube", client: resolved.client }];
     } catch (e) {
       console.error("Play resolve error:", e.message);
       return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
@@ -1157,6 +1267,24 @@ function relogin() {
   setTimeout(login, 5000);
 }
 
+// Keeps a sleeping host (Render free tier) awake so the Discord gateway
+// connection does not drop and slash commands stop answering.
+function startKeepAlive() {
+  const url = (process.env.KEEP_ALIVE_URL || "").trim();
+  if (!url) return;
+  const ping = () => {
+    try {
+      const lib = url.startsWith("http:") ? require("http") : https;
+      const req = lib.get(url, { timeout: 10000 }, (res) => res.resume());
+      req.on("error", () => {});
+      req.on("timeout", () => req.destroy());
+    } catch { /* ignore */ }
+  };
+  setInterval(ping, 10 * 60 * 1000);
+  setTimeout(ping, 20 * 1000);
+  console.log(`Keep-alive: pinging every 10 min -> ${url}`);
+}
+
 async function startBot() {
   // Ensure yt-dlp is available before accepting commands
   await ensureYtDlp();
@@ -1196,6 +1324,8 @@ async function startBot() {
 
   setInterval(applyPresence, 30 * 60 * 1000);
 
+  console.log(`yt-dlp: ${YTDLP} | ffmpeg: ${resolveFfmpeg()}`);
+  startKeepAlive();
   login();
 }
 
@@ -1519,7 +1649,7 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
         } else {
           const resolved = await resolveVideo(query);
           label = resolved.title;
-          entries = [{ url: resolved.url, title: resolved.title, source: "youtube" }];
+          entries = [{ url: resolved.url, title: resolved.title, source: resolved.source || "youtube", client: resolved.client }];
         }
         const qq = getQueue(guildId);
         if (!qq) return res.status(400).json({ error: "Queue was cleared while resolving — try again" });

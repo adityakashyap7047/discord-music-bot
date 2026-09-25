@@ -4,6 +4,10 @@ A Discord music bot with a web dashboard, built with discord.js, yt-dlp, and FFm
 
 ## Features
 - Play YouTube videos (URL or search query) via yt-dlp
+- Play SoundCloud tracks (URL or `scsearch` query)
+- Automatic SoundCloud fallback when YouTube bot-checks the server's IP
+- Play Spotify links — tracks, albums, and playlists (up to 50 tracks per link)
+- Resilient playback: yt-dlp is piped straight through FFmpeg, so a stream hiccup never leaves the channel silent
 - Play Spotify links — tracks, albums, and playlists (up to 50 tracks per link)
 - Queue management
 - Skip, stop, pause, resume
@@ -56,6 +60,7 @@ npm run dev
 | `YTDLP_COOKIES` | Optional — path to a `cookies.txt` that fixes YouTube bot checks |
 | `YTDLP_COOKIES_FROM_BROWSER` | Optional — e.g. `chrome`, logs yt-dlp in with browser cookies (local use) |
 | `YTDLP_CLIENTS` | Optional — comma-separated yt-dlp player clients tried on bot checks |
+| `KEEP_ALIVE_URL` | Optional — public URL of this bot; pinged every 10 min so a free host never sleeps |
 
 ## Commands
 
@@ -96,11 +101,12 @@ How it works:
 
 ## YouTube bot checks ("Sign in to confirm you're not a bot")
 
-YouTube rate-limits IPs it considers automated — especially datacenter IPs (Render, VPS). The bot handles this in three layers:
+YouTube rate-limits IPs it considers automated — especially datacenter IPs (Render, VPS). The bot handles this in four layers:
 
-1. **Automatic player-client fallback** — every yt-dlp call tries the default client first, then each client in `YTDLP_CLIENTS` (default `android_vr,web_embedded,mweb,tv_embedded`) whenever YouTube returns a bot-check or 429. Private/unavailable videos fail immediately without burning fallbacks.
-2. **Request throttling** — yt-dlp calls are serialized with a cooldown to avoid triggering rate limits in the first place.
-3. **Cookies (most reliable)** — set `YTDLP_COOKIES` to the path of a `cookies.txt` exported from a browser where you're logged into YouTube:
+1. **SoundCloud fallback** — when a *search query* is bot-checked, the same query is retried on SoundCloud, which never asks for bot verification. The track is queued with `source: "soundcloud"` and announced as such, so playback keeps going instead of failing. (A pasted YouTube URL is never silently redirected.)
+2. **Automatic player-client fallback** — every yt-dlp call tries the default client first, then each client in `YTDLP_CLIENTS` (default `android_vr,web_embedded,mweb,tv_embedded`) whenever YouTube returns a bot-check or 429. Private/unavailable videos fail immediately without burning fallbacks.
+3. **Request throttling** — yt-dlp calls are serialized with a cooldown to avoid triggering rate limits in the first place.
+4. **Cookies (most reliable)** — set `YTDLP_COOKIES` to the path of a `cookies.txt` exported from a browser where you're logged into YouTube:
 
    ```bash
    # In .env
@@ -109,10 +115,20 @@ YouTube rate-limits IPs it considers automated — especially datacenter IPs (Re
 
    Locally you can instead use `YTDLP_COOKIES_FROM_BROWSER=chrome` (or `firefox`, `edge`). **Never commit `cookies.txt`** — it contains your session.
 
-   On Render this is already wired up: `render.yaml` mounts a persistent disk at `/var/data` and sets `YTDLP_COOKIES=/var/data/cookies.txt`. Upload your `cookies.txt` to that disk (Render dashboard → Disks → Files, or `render disk` CLI) and it survives redeploys. Until the file exists the bot just runs without cookies.
+   On Render's **free plan** there is no persistent disk, so a cookie file cannot survive redeploys: leave `YTDLP_COOKIES` unset there and rely on the SoundCloud fallback.
 
 If the error persists, wait a few minutes — YouTube usually lifts the block on its own.
+
+## Playback pipeline
+
+`yt-dlp -o -` writes the audio to stdout, FFmpeg decodes it to raw 48 kHz stereo PCM, and `@discordjs/voice` encodes it to opus in-process. Nothing is downloaded to disk, the transfer is retried by yt-dlp itself, and the first audio byte has to arrive before the track is considered "started" — so a failed extraction skips the track with an error message instead of silently stalling the channel.
 
 ## Deployment (Render)
 
 The included `render.yaml` deploys the bot + dashboard to Render. The build step installs npm dependencies and downloads the Linux `yt-dlp` binary (FFmpeg comes bundled via `ffmpeg-static`). Set `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `BASE_URL` in the service environment.
+
+Notes:
+
+- The blueprint targets the **Free** plan and declares no disks — disks are a paid-plan feature and would make the deploy fail.
+- Set `KEEP_ALIVE_URL` to the service's own URL (e.g. `https://<your-app>.onrender.com/health`). The bot pings it every 10 minutes so the free instance never sleeps; a sleeping instance drops the Discord gateway and every slash command answers *"The application did not respond"* until something wakes the service.
+- `autoDeployTrigger: commit` redeploys on every push to `master`. GitHub shows no build status for this repo, so if the Render dashboard shows no new deployment after a push, run **Manual Deploy → Clear build cache & deploy** once and check that the repo is actually connected under *Settings → Source*.
