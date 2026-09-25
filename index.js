@@ -1,14 +1,19 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, ActivityType, ApplicationCommandOptionType } = require("discord.js");
+const {
+  Client, GatewayIntentBits, ActivityType, ApplicationCommandOptionType, ChannelType,
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, escapeMarkdown,
+} = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
 const { execFile, spawn } = require("child_process");
 const https = require("https");
 const path = require("path");
+const os = require("os");
 const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 const session = require("express-session");
 const cookieParser = require("cookie-parser");
+const { find: findLyrics } = require("llyrics");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID || "1552647926780534874";
@@ -16,6 +21,54 @@ const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
 const BASE_URL = process.env.BASE_URL || "";
 const BOT_NAME = "NOTIXMIX";
 const START_TIME = Date.now();
+const EMBED_COLOR = parseInt(process.env.EMBED_COLOR || "5865F2", 16) || 0x5865f2;
+const LEAVE_TIMEOUT = Math.max(10000, parseInt(process.env.LEAVE_TIMEOUT || "", 10) || 60000);
+
+// ---------------------------------------------------------------------------
+// Per-guild settings (24/7 mode + autoplay) persisted to a JSON file.
+// Point DATA_DIR at a persistent disk (e.g. /var/data on Render) to keep the
+// settings across redeploys.
+// ---------------------------------------------------------------------------
+const SETTINGS_FILE = path.join(process.env.DATA_DIR || __dirname, "guild-settings.json");
+let guildSettings = {};
+try {
+  guildSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8"));
+} catch {
+  guildSettings = {};
+}
+if (!guildSettings || typeof guildSettings !== "object" || Array.isArray(guildSettings)) guildSettings = {};
+
+let settingsSaveTimer = null;
+
+function getGuildSettings(guildId) {
+  if (!guildSettings[guildId] || typeof guildSettings[guildId] !== "object") guildSettings[guildId] = {};
+  const s = guildSettings[guildId];
+  if (typeof s.autoplay !== "boolean") s.autoplay = false;
+  if (!s.reconnect || typeof s.reconnect !== "object") s.reconnect = { status: false, text: null, voice: null };
+  if (typeof s.reconnect.status !== "boolean") s.reconnect.status = false;
+  if (s.reconnect.text === undefined) s.reconnect.text = null;
+  if (s.reconnect.voice === undefined) s.reconnect.voice = null;
+  return s;
+}
+
+function saveGuildSettings() {
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(guildSettings, null, 2));
+    } catch (e) {
+      console.error("Failed to save guild settings:", e.message);
+    }
+  }, 500);
+}
+
+function isAutoplayOn(guildId) {
+  return !!(guildSettings[guildId] && guildSettings[guildId].autoplay);
+}
+
+function is247On(guildId) {
+  return !!(guildSettings[guildId] && guildSettings[guildId].reconnect && guildSettings[guildId].reconnect.status);
+}
 
 // ---------------------------------------------------------------------------
 // Rate-limited yt-dlp request queue
@@ -128,6 +181,13 @@ const SLASH_COMMANDS = [
   { name: "remove", description: "Remove a song from the queue", options: [{ type: ApplicationCommandOptionType.Integer, name: "number", description: "Queue position (1-based)", required: true, min_value: 1 }] },
   { name: "clear", description: "Clear the queue" },
   { name: "nowplaying", description: "Show the currently playing song" },
+  { name: "shuffle", description: "Shuffle the queue" },
+  { name: "previous", description: "Play the previous song" },
+  { name: "join", description: "Join your voice channel" },
+  { name: "leave", description: "Leave the voice channel" },
+  { name: "autoplay", description: "Toggle autoplay (auto-queue similar tracks)" },
+  { name: "247", description: "Toggle 24/7 mode (stay in voice when idle)" },
+  { name: "lyric", description: "Show lyrics for the current song" },
   { name: "help", description: "List all commands" },
 ];
 
@@ -258,11 +318,11 @@ function parseYtDlpInfo(json) {
     if (!entry) throw new Error("No results");
     const url = entry.webpage_url || entry.url;
     if (!url) throw new Error("No results");
-    return { url, title: entry.title || info.title || "Unknown" };
+    return { url, title: entry.title || info.title || "Unknown", duration: entry.duration || info.duration || null };
   }
 
   if (!info.webpage_url) throw new Error("No results");
-  return { url: info.webpage_url, title: info.title || "Unknown" };
+  return { url: info.webpage_url, title: info.title || "Unknown", duration: info.duration || null };
 }
 
 // SoundCloud has no "not a bot" checks, so it doubles as a free fallback
@@ -484,6 +544,7 @@ function spotifyTrackFields(items) {
     .map((t) => ({
       title: t.name,
       artist: (t.artists || []).map((a) => a && a.name).filter(Boolean).join(", "),
+      duration: typeof t.duration_ms === "number" ? Math.round(t.duration_ms / 1000) : null,
     }));
 }
 
@@ -620,21 +681,60 @@ function stopPipe(pipe) {
   if (!pipe) return;
   try { if (pipe.ytdlp && !pipe.ytdlp.killed) pipe.ytdlp.kill(); } catch { /* already gone */ }
   try { if (pipe.ffmpeg && !pipe.ffmpeg.killed) pipe.ffmpeg.kill(); } catch { /* already gone */ }
+  if (pipe.titleFile) {
+    try { fs.unlinkSync(pipe.titleFile); } catch { /* never written */ }
+    pipe.titleFile = null;
+  }
+}
+
+// What yt-dlp is asked to stream: a pasted URL as-is, otherwise a one-result
+// search. Queuing a search target directly removes the separate metadata
+// extraction that used to run before playback (~7s of "thinking…" per track).
+function songTarget(song, sourceName) {
+  const q = song.search || song.title;
+  if (sourceName === "soundcloud") return `scsearch1:${q}`;
+  if (song.url) return song.url;
+  return `ytsearch1:${q}`;
+}
+
+// Reads the title/duration pair yt-dlp wrote before the first audio byte and
+// cleans the temp file up. Fields are joined with an ASCII unit separator.
+function takePipeInfo(pipe) {
+  if (!pipe || !pipe.titleFile) return null;
+  let raw = null;
+  try { raw = fs.readFileSync(pipe.titleFile, "utf8"); } catch { raw = null; }
+  try { fs.unlinkSync(pipe.titleFile); } catch { /* never written */ }
+  pipe.titleFile = null;
+  if (!raw) return null;
+  const line = raw.split(/\r?\n/)[0];
+  const sep = line.lastIndexOf("\x1f");
+  const title = (sep >= 0 ? line.slice(0, sep) : line).trim();
+  const durStr = sep >= 0 ? line.slice(sep + 1).trim() : "";
+  return {
+    title: title || null,
+    duration: /^\d+$/.test(durStr) ? Number(durStr) : null,
+  };
 }
 
 // Spawns yt-dlp writing audio to stdout, piped through ffmpeg into raw PCM
 // (48kHz stereo) that @discordjs/voice encodes to opus. `started` resolves once
 // audio actually flows, so a failed extraction surfaces as an error we can
 // report instead of leaving the channel in silence.
-function createPipedResource(song) {
+function createPipedResource(song, target, client) {
+  const titleFile = path.join(
+    os.tmpdir(),
+    `notixmix-title-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`
+  );
+
   const ytdlp = spawn(YTDLP, [
     "--no-warnings",
     ...ytCookieArgs(),
     "-f", "bestaudio/best",
     "--no-playlist",
     "-o", "-",
-    ...ytClientArgs(song.client || null),
-    song.url,
+    "--print-to-file", "before_dl:%(title)s\x1f%(duration)s", titleFile,
+    ...ytClientArgs(client || null),
+    target,
   ], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 
   let stderr = "";
@@ -675,7 +775,114 @@ function createPipedResource(song) {
     });
   });
 
-  return { ytdlp, ffmpeg, resource, started };
+  return { ytdlp, ffmpeg, resource, started, titleFile, target };
+}
+
+async function attemptPipe(song, target, client) {
+  const pipe = createPipedResource(song, target, client);
+  try {
+    await pipe.started;
+  } catch (e) {
+    stopPipe(pipe);
+    throw e;
+  }
+  // Swap the queued search term for the real track name (and fill in the
+  // duration) while the queue still shows it — Spotify entries keep their
+  // Spotify title but still learn the duration.
+  const info = takePipeInfo(pipe);
+  if (info) {
+    if (info.title && song.source !== "spotify") song.title = info.title;
+    if (info.duration && !song.duration) song.duration = info.duration;
+  }
+  return pipe;
+}
+
+// Last stream-start measurement, surfaced through /health so the deployed bot
+// can be timed without guessing (playback used to take 15-40s end to end).
+let lastStreamStart = null;
+
+// Resolves a queue entry to a live pipe. One yt-dlp process does the whole job
+// (search + extraction + transfer), with the player-client fallback chain and a
+// SoundCloud retry when YouTube bot-checks a search query.
+async function startSongPipe(song) {
+  const t0 = Date.now();
+  let failed = null;
+  try {
+    const isUrl = !!song.url;
+    const clients = [null, ...resolveYtClients()];
+    let firstErr = null;
+    let lastErr = null;
+    let triedSoundCloud = false;
+
+    for (let i = 0; i < clients.length; i++) {
+      try {
+        return await attemptPipe(song, songTarget(song, "youtube"), clients[i]);
+      } catch (e) {
+        firstErr = firstErr || e;
+        lastErr = e;
+        if (!isTransientYtError(e.message)) throw e;
+
+        // Searches (and Spotify matches) can move to SoundCloud, which has no
+        // bot checks — try it before burning the remaining client fallbacks.
+        if (!isUrl && !triedSoundCloud) {
+          triedSoundCloud = true;
+          try {
+            const pipe = await attemptPipe(song, songTarget(song, "soundcloud"), null);
+            song.source = "soundcloud";
+            return pipe;
+          } catch (scErr) {
+            lastErr = scErr;
+          }
+        }
+
+        if (i < clients.length - 1) await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+    throw lastErr || firstErr;
+  } catch (e) {
+    failed = e;
+    throw e;
+  } finally {
+    lastStreamStart = {
+      ms: Date.now() - t0,
+      ok: !failed,
+      source: song.source || null,
+      at: new Date().toISOString(),
+    };
+    if (!failed) console.log(`Stream ready in ${lastStreamStart.ms}ms (${lastStreamStart.source}) — ${song.title}`);
+  }
+}
+
+// Extraction is the slow part of playback (~5s), so the next track is started
+// while the current one is still playing: /play overlaps it with the voice
+// join, and the queue hand-off becomes instant.
+function prewarmNext(guildId) {
+  const q = getQueue(guildId);
+  if (!q || !q.songs.length) return;
+  if (q._starting && !q._pipe) return; // play() is already fetching songs[0]
+  const song = q.songs[q._pipe ? 1 : 0];
+  if (!song) return;
+  if (q._prewarm && q._prewarm.song === song) return;
+  stopPrewarm(q);
+  const promise = startSongPipe(song).catch(() => {});
+  q._prewarm = { song, promise };
+}
+
+function stopPrewarm(q) {
+  if (!q || !q._prewarm) return;
+  const entry = q._prewarm;
+  q._prewarm = null;
+  entry.promise.then((pipe) => stopPipe(pipe), () => {});
+}
+
+function takePrewarm(q, song) {
+  if (q && q._prewarm && q._prewarm.song === song) {
+    const entry = q._prewarm;
+    q._prewarm = null;
+    return entry.promise;
+  }
+  stopPrewarm(q);
+  return null;
 }
 
 function createClient() {
@@ -692,6 +899,7 @@ function getQueue(guildId) {
 function createQueue(guildId) {
   const q = {
     songs: [],
+    history: [],                 // recently played tracks (for /previous)
     volume: 5,
     loop: false,
     textChannel: null,
@@ -699,12 +907,22 @@ function createQueue(guildId) {
     connection: null,
     player: null,
     resource: null,
+    npMessage: null,             // now-playing controller message
+    npCollector: null,
+    npSong: null,
     _starting: false,
     _announceNext: false,
     _advanceMode: null, // null = default advance, "keep" = songs already adjusted, "force" = advance even when looping
+    _emptyHandled: false,
   };
   queue.set(guildId, q);
   return q;
+}
+
+function pushHistory(q, song) {
+  if (!song) return;
+  q.history.push(song);
+  if (q.history.length > 25) q.history.shift();
 }
 
 function destroyVoice(q) {
@@ -713,6 +931,11 @@ function destroyVoice(q) {
     if (q) q._pipe = null;
   } catch (e) {
     console.error("Pipe destroy failed:", e);
+  }
+  try {
+    stopPrewarm(q);
+  } catch (e) {
+    console.error("Prewarm destroy failed:", e);
   }
   try {
     if (q && q.connection && q.connection.state && q.connection.state.status !== "destroyed") {
@@ -724,18 +947,116 @@ function destroyVoice(q) {
 }
 
 function destroyQueue(guildId, q) {
+  clearNowPlaying(q);
+  cancelAutoLeave(guildId);
   destroyVoice(q);
   queue.delete(guildId);
 }
 
+// Runs when the queue runs dry: tries autoplay first, then falls back to
+// 24/7 mode (stay connected) or a plain disconnect, mirroring Lunox's
+// queueEmpty event.
+function handleQueueEmpty(guildId, q) {
+  if (q._emptyHandled) return;
+  q._emptyHandled = true;
+  (async () => {
+    try {
+      if (isAutoplayOn(guildId)) {
+        const song = await resolveAutoplaySong(q);
+        if (getQueue(guildId) !== q) return;
+        q._emptyHandled = false;
+        if (song && q.songs.length === 0) {
+          q.songs.push(song);
+          if (q.textChannel) safeSend(q.textChannel, { content: `🔁 Autoplay: queued **${song.title}**` });
+          play(guildId).catch(() => {});
+          return;
+        }
+        if (song) return; // someone queued a track while we were resolving
+        getGuildSettings(guildId).autoplay = false;
+        saveGuildSettings();
+        if (q.textChannel) safeSend(q.textChannel, "🔁 Autoplay couldn't find similar tracks — turning it off.");
+      }
+    } catch (e) {
+      console.error("Autoplay error:", e.message);
+      if (getQueue(guildId) === q) q._emptyHandled = false;
+    }
+    if (getQueue(guildId) !== q || q.songs.length > 0) return;
+    q._emptyHandled = false;
+    if (is247On(guildId)) {
+      if (q.textChannel) safeSend(q.textChannel, "🌙 Queue finished — staying connected (24/7 mode).");
+      return;
+    }
+    destroyQueue(guildId, q);
+  })();
+}
+
+function youtubeIdFromUrl(url) {
+  const m = String(url || "").match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([\w-]{11})/);
+  return m ? m[1] : null;
+}
+
+// Picks the next track when autoplay is on. Uses the YouTube "mix" radio of
+// the last played track (the same trick Lunox uses with list=RD<id>), and
+// falls back to a plain search when the mix lookup fails.
+async function resolveAutoplaySong(q) {
+  const last = q.history.length ? q.history[q.history.length - 1] : q.songs[0];
+  const id = last && last.url ? youtubeIdFromUrl(last.url) : null;
+
+  if (id) {
+    try {
+      const json = await runYtDlp(
+        ["-J", "--flat-playlist", "--playlist-end", "25", `https://music.youtube.com/watch?v=${id}&list=RD${id}`],
+        45000
+      );
+      const info = JSON.parse(json);
+      const entries = (info && Array.isArray(info.entries)) ? info.entries : [];
+      const candidates = entries.filter((e) => e && e.id && e.id !== id);
+      if (candidates.length) {
+        const pick = candidates[Math.floor(Math.random() * candidates.length)];
+        return {
+          url: `https://www.youtube.com/watch?v=${pick.id}`,
+          title: pick.title || "Unknown",
+          source: "youtube",
+          client: null,
+          duration: typeof pick.duration === "number" ? pick.duration : null,
+          requester: "Autoplay",
+          requesterId: null,
+        };
+      }
+    } catch (e) {
+      console.warn("Autoplay mix lookup failed:", String(e.message).split("\n")[0]);
+    }
+  }
+
+  if (!last || !last.title) return null;
+  const query = last.artist ? `${last.artist} - ${last.title}` : last.title;
+  try {
+    const resolved = await resolveVideo(query);
+    return {
+      url: resolved.url,
+      title: resolved.title,
+      source: resolved.source || "youtube",
+      client: resolved.client,
+      duration: resolved.duration || null,
+      requester: "Autoplay",
+      requesterId: null,
+    };
+  } catch (e) {
+    console.warn("Autoplay search failed:", String(e.message).split("\n")[0]);
+    return null;
+  }
+}
+
 async function play(guildId) {
   const q = getQueue(guildId);
-  if (!q || q.songs.length === 0) {
-    if (q) destroyQueue(guildId, q);
+  if (!q) return;
+  if (q.songs.length === 0) {
+    handleQueueEmpty(guildId, q);
     return;
   }
   if (q._starting) return;
   q._starting = true;
+  q._emptyHandled = false;
 
   if (!q.connection || q.connection.state.status === VoiceConnectionStatus.Destroyed) {
     q._starting = false;
@@ -745,50 +1066,30 @@ async function play(guildId) {
     }
     return;
   }
-  try {
-    await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
-  } catch {
-    q._starting = false;
-    if (getQueue(guildId) === q) {
-      destroyQueue(guildId, q);
-      if (q.textChannel) {
-        safeSend(q.textChannel, "❌ Could not connect to the voice channel — stopped playback.");
-      }
-    }
-    return;
-  }
-
   const song = q.songs[0];
+
+  // Extraction is the slow part (~5s): start it now so it overlaps the voice
+  // connection coming up instead of running after it. A prewarmed pipe for this
+  // exact track is reused, which is what makes queue hand-offs instant.
+  const pipePromise = takePrewarm(q, song) || startSongPipe(song);
+  pipePromise.catch(() => {}); // may be abandoned before we await it
+  const voiceReady = entersState(q.connection, VoiceConnectionStatus.Ready, 20000)
+    .then(() => true, () => false);
+
   let pipe = null;
-
   try {
-    // Spotify tracks are queued without a stream URL — resolve the match
-    // lazily right before playback so big playlists load instantly.
-    if (!song.url) {
-      const resolved = await resolveVideo(song.search || song.title);
-      if (getQueue(guildId) !== q) {
-        q._starting = false;
-        return;
-      }
-      if (q.songs[0] !== song) {
-        q._starting = false;
-        play(guildId).catch(() => {});
-        return;
-      }
-      song.url = resolved.url;
-      song.client = resolved.client;
-      song.source = resolved.source || song.source;
-    }
+    pipe = await pipePromise;
 
-    // yt-dlp -> ffmpeg -> PCM. `started` only resolves once audio flows, so a
-    // bot-check or bad URL throws into the catch below and skips the track.
-    pipe = createPipedResource(song);
-    try {
-      await pipe.started;
-    } catch (e) {
+    if (!(await voiceReady)) {
       stopPipe(pipe);
-      pipe = null;
-      throw e;
+      q._starting = false;
+      if (getQueue(guildId) === q) {
+        destroyQueue(guildId, q);
+        if (q.textChannel) {
+          safeSend(q.textChannel, "❌ Could not connect to the voice channel — stopped playback.");
+        }
+      }
+      return;
     }
 
     if (getQueue(guildId) !== q) {
@@ -821,7 +1122,7 @@ async function play(guildId) {
       if (mode === "keep") {
         play(guildId).catch(() => {});
       } else if (mode === "force" || !q.loop) {
-        q.songs.shift();
+        pushHistory(q, q.songs.shift());
         play(guildId).catch(() => {});
       } else {
         play(guildId).catch(() => {});
@@ -831,10 +1132,7 @@ async function play(guildId) {
     q.player.on(AudioPlayerStatus.Playing, () => {
       if (!q._announceNext) return;
       q._announceNext = false;
-      if (q.textChannel) {
-        const label = song.source === "soundcloud" ? `**${song.title}** _(SoundCloud)_` : `**${song.title}**`;
-        safeSend(q.textChannel, { content: `🎵 Now playing: ${label}` });
-      }
+      sendNowPlaying(guildId, q, song);
     });
 
     q.player.on("error", (error) => {
@@ -876,6 +1174,9 @@ async function play(guildId) {
     return play(guildId);
   }
   q._starting = false;
+  // This track is streaming — start fetching the next one now so the hand-off
+  // does not wait for another extraction.
+  prewarmNext(guildId);
 }
 
 function addSongToQueue(guildId, songs, textChannel) {
@@ -885,34 +1186,49 @@ function addSongToQueue(guildId, songs, textChannel) {
   return q;
 }
 
+function attachDisconnectHandler(guildId, q) {
+  if (!q.connection || q.connection._notixmixGuard) return;
+  q.connection._notixmixGuard = true;
+  q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    if (getQueue(guildId) !== q) return;
+    try {
+      await Promise.race([
+        entersState(q.connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(q.connection, VoiceConnectionStatus.Connecting, 5000),
+      ]);
+      await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+    } catch {
+      if (getQueue(guildId) === q) {
+        destroyQueue(guildId, q);
+      }
+    }
+  });
+}
+
+// Joins a voice channel for an existing queue and wires up reconnection.
+function connectVoice(guildId, voiceChannel, adapterCreator) {
+  const q = getQueue(guildId);
+  if (!q) return null;
+  if (q.connection && q.connection.state.status !== VoiceConnectionStatus.Destroyed) return q.connection;
+  try {
+    q.connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guildId,
+      adapterCreator,
+    });
+    q.voiceChannel = voiceChannel;
+    attachDisconnectHandler(guildId, q);
+    return q.connection;
+  } catch (e) {
+    console.error(e);
+    return null;
+  }
+}
+
 function setupVoiceConnection(guildId, voiceChannel, message) {
   const q = getQueue(guildId);
   if (!q.voiceChannel) {
-    try {
-      q.connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: guildId,
-        adapterCreator: message.guild.voiceAdapterCreator,
-      });
-      q.voiceChannel = voiceChannel;
-      q.connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        if (getQueue(guildId) !== q) return;
-        try {
-          await Promise.race([
-            entersState(q.connection, VoiceConnectionStatus.Signalling, 5000),
-            entersState(q.connection, VoiceConnectionStatus.Connecting, 5000),
-          ]);
-          await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
-        } catch {
-          if (getQueue(guildId) === q) {
-            destroyVoice(q);
-            queue.delete(guildId);
-          }
-        }
-      });
-    } catch (e) {
-      console.error(e);
-    }
+    connectVoice(guildId, voiceChannel, message.guild.voiceAdapterCreator);
   }
 }
 
@@ -955,26 +1271,35 @@ async function handlePlayCommand(message, args) {
       url: null,
       title: t.title,
       artist: t.artist,
+      duration: t.duration || null,
       search: spotifySearchQuery(t),
       source: "spotify",
+      requester: message.author?.tag || "Unknown",
+      requesterId: message.author?.id || null,
     }));
     if (sp.total > sp.tracks.length) {
       container = `${sp.title} (first ${sp.tracks.length} of ${sp.total})`;
     }
   } else {
-    try {
-      const resolved = await resolveVideo(query);
-      songs = [{ url: resolved.url, title: resolved.title, source: resolved.source || "youtube", client: resolved.client }];
-    } catch (e) {
-      console.error("Play resolve error:", e.message);
-      return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
-    }
+    // No yt-dlp call here on purpose: resolving the search before replying is
+    // what made /play look stuck. The queue entry carries the query and the
+    // real title/duration arrive with the stream itself.
+    const direct = isYouTubeUrl(query) || isSoundCloudUrl(query);
+    songs = [{
+      url: direct ? query : null,
+      search: direct ? null : query,
+      title: query,
+      source: isSoundCloudUrl(query) ? "soundcloud" : "youtube",
+      requester: message.author?.tag || "Unknown",
+      requesterId: message.author?.id || null,
+    }];
   }
 
   const existing = getQueue(guildId);
   const wasEmpty = !existing || existing.songs.length === 0;
   const q = addSongToQueue(guildId, songs, textChannel);
   const first = songs[0];
+  prewarmNext(guildId); // extraction overlaps the voice join below
 
   if (wasEmpty) {
     message.reply(
@@ -985,15 +1310,14 @@ async function handlePlayCommand(message, args) {
     setupVoiceConnection(guildId, voiceChannel, message);
     try {
       if (!q.connection) {
-        queue.delete(guildId);
+        destroyQueue(guildId, q);
         message.reply("❌ Could not join voice channel!").catch(() => {});
         return;
       }
       await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
       play(guildId).catch(() => {});
     } catch {
-      destroyVoice(q);
-      queue.delete(guildId);
+      destroyQueue(guildId, q);
       message.reply("❌ Could not join voice channel!").catch(() => {});
     }
   } else if (songs.length > 1) {
@@ -1017,15 +1341,17 @@ function handleSkipCommand(message) {
 }
 
 function handleStopCommand(message) {
-  const q = getQueue(message.guild.id);
+  const guildId = message.guild.id;
+  const q = getQueue(guildId);
   if (!q) {
     return message.reply("❌ Nothing is playing!").catch(() => {});
   }
-  q.songs = [];
-  queue.delete(message.guild.id);
-  if (q.player) q.player.stop(true);
-  destroyVoice(q);
+  // Reply before tearing down: from the now-playing buttons the reply is tied
+  // to this interaction, so it must not race the message deletion below.
   message.reply("⏹️ Stopped!").catch(() => {});
+  q.songs = [];
+  destroyQueue(guildId, q);
+  if (q.player) q.player.stop(true);
 }
 
 function handlePauseCommand(message) {
@@ -1036,6 +1362,7 @@ function handlePauseCommand(message) {
   if (!q.player.pause()) {
     return message.reply("⚠️ Playback is not active right now!").catch(() => {});
   }
+  refreshNowPlaying(q);
   message.reply("⏸️ Paused!").catch(() => {});
 }
 
@@ -1047,6 +1374,7 @@ function handleResumeCommand(message) {
   if (!q.player.unpause()) {
     return message.reply("⚠️ Playback is not paused!").catch(() => {});
   }
+  refreshNowPlaying(q);
   message.reply("▶️ Resumed!").catch(() => {});
 }
 
@@ -1055,13 +1383,24 @@ function handleQueueCommand(message) {
   if (!q || q.songs.length === 0) {
     return message.reply("❌ The queue is empty!").catch(() => {});
   }
-  const MAX_LINES = 15;
-  const shown = q.songs.slice(0, MAX_LINES);
-  const list = shown.map((s, i) => `${i + 1}. ${s.title}`).join("\n");
-  const more = q.songs.length > MAX_LINES ? `\n… and ${q.songs.length - MAX_LINES} more` : "";
-  let content = `📋 Queue:\n${list}${more}`;
-  if (content.length > 1900) content = content.slice(0, 1900) + "\n…";
-  message.reply({ content }).catch(() => {});
+  const lines = q.songs.map((s, i) => {
+    const title = escapeMarkdown(String(s.title || "Unknown"));
+    const artist = s.artist ? ` — ${escapeMarkdown(s.artist)}` : "";
+    const duration = s.duration ? `\`${formatDuration(s.duration)}\`` : "`--:--`";
+    return `\`${i + 1}.\` **${title}**${artist}  •  ${duration}`;
+  });
+  const pages = chunk(lines, 10).map((p) => p.join("\n"));
+  const totalSeconds = q.songs.reduce((sum, s) => sum + (Number(s.duration) || 0), 0);
+  const embed = new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setAuthor({ name: "Queue List", iconURL: client.user.displayAvatarURL() })
+    .setFooter({
+      text: `Total songs: ${q.songs.length}${totalSeconds ? `  •  Total duration: ${formatDuration(totalSeconds)}` : ""}${q.loop ? "  •  Loop on" : ""}`,
+    });
+  sendPaginated(message, embed, pages).catch((e) => {
+    console.error("Queue pagination failed:", e);
+    message.reply("❌ Couldn't show the queue — try again.").catch(() => {});
+  });
 }
 
 function handleLoopCommand(message) {
@@ -1070,6 +1409,7 @@ function handleLoopCommand(message) {
     return message.reply("❌ Nothing is playing!").catch(() => {});
   }
   q.loop = !q.loop;
+  refreshNowPlaying(q);
   message.reply(q.loop ? "🔁 Loop enabled!" : "🔁 Loop disabled!").catch(() => {});
 }
 
@@ -1100,30 +1440,36 @@ function handleRemoveCommand(message, args) {
   }
   const removed = q.songs.splice(index, 1)[0];
   if (index === 0) {
-    // Current track was removed: advance without letting the Idle
-    // handler shift again (that would drop the next song too).
-    // stop() emits Idle synchronously, so flag first — but only when the
-    // player is actually active (a no-op stop would leave the flag stale
-    // and make the next song replay instead of advancing).
-    const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
-    if (active) q._advanceMode = "keep";
-    if (q.player) q.player.stop(true);
-    if (q.songs.length === 0) destroyQueue(message.guild.id, q);
-    else if (!active && !q._starting) play(message.guild.id).catch(() => {});
+    if (q.songs.length === 0) {
+      // Tearing the player down first means the Idle handler can't kick in
+      // autoplay for a queue the user just emptied on purpose.
+      destroyQueue(message.guild.id, q);
+      if (q.player) q.player.stop(true);
+    } else {
+      // Current track was removed: advance without letting the Idle
+      // handler shift again (that would drop the next song too).
+      // stop() emits Idle synchronously, so flag first — but only when the
+      // player is actually active (a no-op stop would leave the flag stale
+      // and make the next song replay instead of advancing).
+      const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
+      if (active) q._advanceMode = "keep";
+      if (q.player) q.player.stop(true);
+      else if (!q._starting) play(message.guild.id).catch(() => {});
+    }
   }
   message.reply(`🗑️ Removed: ${removed.title}`).catch(() => {});
 }
 
 function handleClearCommand(message) {
-  const q = getQueue(message.guild.id);
+  const guildId = message.guild.id;
+  const q = getQueue(guildId);
   if (!q || q.songs.length === 0) {
     return message.reply("❌ Nothing in the queue!").catch(() => {});
   }
-  q.songs = [];
-  queue.delete(message.guild.id);
-  if (q.player) q.player.stop(true);
-  destroyVoice(q);
   message.reply("🗑️ Queue cleared!").catch(() => {});
+  q.songs = [];
+  destroyQueue(guildId, q);
+  if (q.player) q.player.stop(true);
 }
 
 function handleNowPlayingCommand(message) {
@@ -1139,21 +1485,626 @@ function handleHelpCommand(message) {
     `**${BOT_NAME} Commands**`,
     "`/play <url/query>` — Play YouTube, Spotify (track/album/playlist), or search",
     "`/skip` — Skip the current song",
+    "`/previous` — Play the previous song",
     "`/stop` — Stop playback and clear the queue",
-    "`/pause` — Pause playback",
-    "`/resume` — Resume playback",
-    "`/queue` — Show the queue",
+    "`/pause` / `/resume` — Pause or resume playback",
+    "`/queue` — Show the queue (paginated)",
+    "`/nowplaying` — Show the current song with control buttons",
+    "`/shuffle` — Shuffle the queue",
     "`/loop` — Toggle loop mode",
     "`/volume <0-10>` — Set volume",
     "`/remove <n>` — Remove a song by number",
     "`/clear` — Clear the queue",
-    "`/nowplaying` — Show the current song",
+    "`/join` / `/leave` — Join or leave your voice channel",
+    "`/autoplay` — Toggle autoplay (auto-queue similar tracks)",
+    "`/247` — Toggle 24/7 mode (stay connected when idle)",
+    "`/lyric` — Lyrics for the current song",
     "`/help` — Show this message",
   ];
   message.reply({ content: lines.join("\n") }).catch(() => {});
 }
 
-const VOICE_COMMANDS = new Set(["play", "stop", "skip", "pause", "resume"]);
+// ---------------------------------------------------------------------------
+// Small formatting helpers (ported from Lunox functions/timeFormat.js)
+// ---------------------------------------------------------------------------
+function formatDuration(totalSeconds) {
+  const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const p = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${p(m)}:${p(sec)}` : `${m}:${p(sec)}`;
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function capitalize(str) {
+  const s = String(str || "");
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function applyVolume(q, vol) {
+  q.volume = vol;
+  if (q.player && q.resource && q.resource.volume) {
+    q.resource.volume.setVolume(vol / 10);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Now-playing controller (ported from Lunox events/rainlink/player/trackStart.js)
+// Sends an embed with playback buttons whenever a track starts and keeps it in
+// sync while the track is playing.
+// ---------------------------------------------------------------------------
+function buildNowPlayingEmbed(q, song) {
+  const clip = (str, max) => {
+    const s = String(str || "Unknown");
+    return s.length > max ? s.slice(0, max - 3) + "..." : s;
+  };
+  const paused = !!(q.player && q.player.state.status === AudioPlayerStatus.Paused);
+  const title = clip(String(song.title || "Unknown").replace(/ - Topic$/, ""), 40);
+  const artist = song.artist ? clip(song.artist, 30) : null;
+  const label = artist ? `${title} - ${artist}` : title;
+  const embed = new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setAuthor({ name: paused ? "Song Paused" : "Now Playing", iconURL: client.user.displayAvatarURL() })
+    .setFields(
+      { name: "Source", value: capitalize(song.source || "youtube"), inline: true },
+      { name: "Duration", value: `\`${song.duration ? formatDuration(song.duration) : "LIVE/—"}\``, inline: true },
+      { name: "Requested by", value: escapeMarkdown(String(song.requester || "Unknown")), inline: true },
+    );
+  if (song.url) embed.setDescription(`**[${escapeMarkdown(label)}](${song.url})**`);
+  else embed.setDescription(`**${escapeMarkdown(label)}**`);
+  return embed;
+}
+
+function nowPlayingRows(q) {
+  const paused = !!(q.player && q.player.state.status === AudioPlayerStatus.Paused);
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("np_pause").setEmoji(paused ? "▶️" : "⏸️")
+      .setStyle(paused ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("np_voldown").setEmoji("🔉").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("np_volup").setEmoji("🔊").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("np_loop").setEmoji("🔁").setStyle(q.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("np_shuffle").setEmoji("🔀").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("np_prev").setEmoji("⏮️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("np_skip").setEmoji("⏭️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("np_stop").setEmoji("⏹️").setStyle(ButtonStyle.Danger),
+  );
+  return [row1, row2];
+}
+
+function clearNowPlaying(q) {
+  if (!q) return;
+  if (q.npCollector) {
+    try { q.npCollector.stop("cleanup"); } catch { /* already stopped */ }
+    q.npCollector = null;
+  }
+  const msg = q.npMessage;
+  q.npMessage = null;
+  q.npSong = null;
+  if (msg) {
+    try { msg.delete().catch(() => {}); } catch { /* already gone */ }
+  }
+}
+
+function refreshNowPlaying(q) {
+  if (!q || !q.npMessage || !q.npSong) return;
+  try {
+    q.npMessage.edit({ embeds: [buildNowPlayingEmbed(q, q.npSong)], components: nowPlayingRows(q) }).catch(() => {});
+  } catch { /* message gone */ }
+}
+
+async function sendNowPlaying(guildId, q, song) {
+  clearNowPlaying(q);
+  const channel = q.textChannel;
+  if (!channel || typeof channel.send !== "function") return;
+  try {
+    const msg = await channel.send({ embeds: [buildNowPlayingEmbed(q, song)], components: nowPlayingRows(q) });
+    q.npMessage = msg;
+    q.npSong = song;
+    if (!msg || typeof msg.createMessageComponentCollector !== "function") return;
+    const collector = msg.createMessageComponentCollector();
+    q.npCollector = collector;
+    collector.on("collect", (btn) => handleNowPlayingButton(btn, guildId, q, song));
+  } catch (e) {
+    console.error("Now-playing message failed:", e.message);
+  }
+}
+
+// Wraps a button interaction so the existing slash command handlers can be
+// reused — replies become ephemeral, matching Lunox's controller feedback.
+function buttonCtx(btn, guildId) {
+  const reply = (payload) => {
+    const data = typeof payload === "string" ? { content: payload, flags: 64 } : { ...payload, flags: 64 };
+    return btn.reply(data).catch(() => {});
+  };
+  return {
+    guild: btn.guild,
+    member: btn.member,
+    author: btn.user,
+    user: btn.user,
+    channel: btn.channel || { send: () => Promise.resolve() },
+    reply,
+    _guildId: guildId,
+  };
+}
+
+async function handleNowPlayingButton(btn, guildId, q, song) {
+  const member = btn.member;
+  const vc = member && member.voice ? member.voice.channel : null;
+  const botVcId = q.voiceChannel ? q.voiceChannel.id : null;
+  if (!vc || vc.id !== botVcId) {
+    return btn.reply({ content: "❌ You must be in the same voice channel as the bot.", flags: 64 }).catch(() => {});
+  }
+  const isRequester = !!(song.requesterId && btn.user.id === song.requesterId);
+  const canManage = !!(member.permissions && member.permissions.has("ManageGuild"));
+  if (!isRequester && !canManage) {
+    return btn.reply({ content: "❌ Only the requester can use these controls.", flags: 64 }).catch(() => {});
+  }
+  if (getQueue(guildId) !== q) {
+    return btn.reply({ content: "⚠️ This player has expired — use a slash command instead.", flags: 64 }).catch(() => {});
+  }
+
+  switch (btn.customId) {
+    case "np_pause": {
+      if (!q.player) return btn.reply({ content: "❌ Nothing is playing!", flags: 64 }).catch(() => {});
+      const paused = q.player.state.status === AudioPlayerStatus.Paused;
+      if (paused) q.player.unpause();
+      else q.player.pause();
+      btn.deferUpdate().catch(() => {});
+      refreshNowPlaying(q);
+      return;
+    }
+    case "np_voldown": {
+      const v = Math.max(0, q.volume - 1);
+      applyVolume(q, v);
+      return btn.reply({ content: `🔉 Volume set to ${v}`, flags: 64 }).catch(() => {});
+    }
+    case "np_volup": {
+      const v = Math.min(10, q.volume + 1);
+      applyVolume(q, v);
+      return btn.reply({ content: `🔊 Volume set to ${v}`, flags: 64 }).catch(() => {});
+    }
+    case "np_loop": return handleLoopCommand(buttonCtx(btn, guildId));
+    case "np_shuffle": return handleShuffleCommand(buttonCtx(btn, guildId));
+    case "np_prev": return handlePreviousCommand(buttonCtx(btn, guildId));
+    case "np_skip": return handleSkipCommand(buttonCtx(btn, guildId));
+    case "np_stop": return handleStopCommand(buttonCtx(btn, guildId));
+    default:
+      return btn.reply({ content: "❌ Unknown button.", flags: 64 }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Paginated messages (ported from Lunox functions/createPage.js)
+// ---------------------------------------------------------------------------
+async function sendPaginated(ctx, embed, pages) {
+  let page = 0;
+  const render = () => embed.setDescription(pages[page] || "No data found.");
+  render();
+
+  if (pages.length <= 1) return ctx.reply({ embeds: [embed] });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("page_first").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("page_back").setEmoji("◀").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("page_close").setEmoji("✖").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("page_next").setEmoji("▶").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("page_last").setEmoji("⏭").setStyle(ButtonStyle.Secondary),
+  );
+
+  const msg = await ctx.reply({ embeds: [embed], components: [row] });
+  if (!msg || typeof msg.createMessageComponentCollector !== "function") return msg;
+
+  const ownerId = (ctx.user || ctx.author || {}).id;
+  const collector = msg.createMessageComponentCollector({ time: 60000 });
+
+  collector.on("collect", async (btn) => {
+    if (btn.user.id !== ownerId) {
+      return btn.reply({ content: "❌ You are not allowed to use these buttons.", flags: 64 }).catch(() => {});
+    }
+    await btn.deferUpdate().catch(() => {});
+    switch (btn.customId) {
+      case "page_first": page = 0; break;
+      case "page_back": page = Math.max(0, page - 1); break;
+      case "page_close": collector.stop("closed"); return;
+      case "page_next": page = Math.min(pages.length - 1, page + 1); break;
+      case "page_last": page = pages.length - 1; break;
+    }
+    render();
+    msg.edit({ embeds: [embed], components: [row] }).catch(() => {});
+  });
+
+  collector.on("end", () => msg.edit({ components: [] }).catch(() => {}));
+  return msg;
+}
+
+// ---------------------------------------------------------------------------
+// New commands: /shuffle, /previous, /join, /leave, /autoplay, /247, /lyric
+// ---------------------------------------------------------------------------
+function handleShuffleCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Queue is empty. Shuffle not possible.").catch(() => {});
+  }
+  if (q.songs.length <= 1) {
+    return message.reply("❌ Only one song in the queue. Shuffle not possible.").catch(() => {});
+  }
+  const current = q.songs[0];
+  const rest = q.songs.slice(1);
+  for (let i = rest.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [rest[i], rest[j]] = [rest[j], rest[i]];
+  }
+  q.songs = [current, ...rest];
+  message.reply("🔀 Shuffled the queue!").catch(() => {});
+}
+
+function handlePreviousCommand(message) {
+  const guildId = message.guild.id;
+  const q = getQueue(guildId);
+  if (!q) return message.reply("❌ Nothing is playing!").catch(() => {});
+  if (!q.history.length) return message.reply("❌ Previous song not found.").catch(() => {});
+
+  const prev = q.history.pop();
+  q.songs.unshift(prev);
+  // Reply first: this can also run from the now-playing buttons, and starting
+  // the previous track deletes that message.
+  message.reply(`⏮️ Playing the previous song: **${escapeMarkdown(prev.title)}**`).catch(() => {});
+  const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
+  if (active) {
+    // "keep" stops the player without shifting the songs array, so play()
+    // restarts from the track we just moved to the front.
+    q._advanceMode = "keep";
+    q.player.stop(true);
+  } else if (!q._starting) {
+    play(guildId).catch(() => {});
+  }
+}
+
+async function handleJoinCommand(message) {
+  const guildId = message.guild.id;
+  const voiceChannel = message.member?.voice?.channel;
+  if (!voiceChannel) {
+    return message.reply("❌ You need to be in a voice channel first!").catch(() => {});
+  }
+  const existing = getQueue(guildId);
+  if (existing && existing.connection && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+    return message.reply(`✅ I'm already connected to **${escapeMarkdown(existing.voiceChannel ? existing.voiceChannel.name : "a voice channel")}**.`).catch(() => {});
+  }
+
+  const q = existing || createQueue(guildId);
+  if (!q.textChannel) q.textChannel = message.channel;
+  const conn = connectVoice(guildId, voiceChannel, message.guild.voiceAdapterCreator);
+  if (!conn) {
+    if (!existing) destroyQueue(guildId, q);
+    return message.reply("❌ Could not join the voice channel!").catch(() => {});
+  }
+  try {
+    await entersState(conn, VoiceConnectionStatus.Ready, 20000);
+    cancelAutoLeave(guildId);
+    message.reply(`✅ Joined **${escapeMarkdown(voiceChannel.name)}**.`).catch(() => {});
+  } catch {
+    if (getQueue(guildId) === q && q.songs.length === 0) destroyQueue(guildId, q);
+    message.reply("❌ Could not connect to the voice channel!").catch(() => {});
+  }
+}
+
+function handleLeaveCommand(message) {
+  const guildId = message.guild.id;
+  const q = getQueue(guildId);
+  if (!q) return message.reply("❌ I'm not connected to a voice channel.").catch(() => {});
+  q.songs = [];
+  destroyQueue(guildId, q);
+  message.reply("👋 Left the voice channel.").catch(() => {});
+}
+
+function handle247Command(message) {
+  const guildId = message.guild.id;
+  const s = getGuildSettings(guildId);
+  const q = getQueue(guildId);
+  s.reconnect.status = !s.reconnect.status;
+  s.reconnect.voice = (q && q.voiceChannel ? q.voiceChannel.id : message.member?.voice?.channelId) || s.reconnect.voice;
+  s.reconnect.text = (q && q.textChannel && q.textChannel.id ? q.textChannel.id : message.channel?.id) || s.reconnect.text;
+  saveGuildSettings();
+
+  if (s.reconnect.status) {
+    cancelAutoLeave(guildId);
+    // Not connected yet: join straight away so 24/7 mode does something.
+    if (!q) {
+      const voiceChannel = message.member?.voice?.channel;
+      if (voiceChannel) {
+        const nq = createQueue(guildId);
+        nq.textChannel = message.channel;
+        if (!connectVoice(guildId, voiceChannel, message.guild.voiceAdapterCreator)) {
+          destroyQueue(guildId, nq);
+          return message.reply("❌ Could not join the voice channel!").catch(() => {});
+        }
+      }
+    }
+    return message.reply("🌙 24/7 mode **enabled** — I'll stay in the voice channel even when the queue is empty.").catch(() => {});
+  }
+  message.reply("☀️ 24/7 mode **disabled** — I'll leave after inactivity.").catch(() => {});
+}
+
+function handleAutoplayCommand(message) {
+  const guildId = message.guild.id;
+  const s = getGuildSettings(guildId);
+  s.autoplay = !s.autoplay;
+  saveGuildSettings();
+  message.reply(s.autoplay
+    ? "🔁 Autoplay **enabled** — I'll queue similar tracks when the queue runs dry."
+    : "🔁 Autoplay **disabled**.").catch(() => {});
+}
+
+function splitSongTitle(song) {
+  const raw = String(song.title || "").replace(/ - Topic$/i, "").trim();
+  if (song.artist) return { title: raw, artist: song.artist };
+  const m = raw.match(/^(.+?)\s+[-–—]\s+(.+)$/);
+  if (m) return { title: m[2], artist: m[1] };
+  return { title: raw, artist: "" };
+}
+
+async function handleLyricCommand(message) {
+  const q = getQueue(message.guild.id);
+  if (!q || q.songs.length === 0) {
+    return message.reply("❌ Nothing is playing!").catch(() => {});
+  }
+  const song = q.songs[0];
+  const { title, artist } = splitSongTitle(song);
+
+  let lyrics = null;
+  try {
+    const res = await findLyrics({ song: title, artist, engine: "youtube", forceSearch: true });
+    lyrics = res && res.lyrics ? String(res.lyrics).trim() : null;
+  } catch (e) {
+    console.error("Lyrics lookup failed:", e.message);
+  }
+
+  if (!lyrics) {
+    return message.reply({ content: `❌ No lyrics found for **${escapeMarkdown(song.title)}**.` }).catch(() => {});
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setAuthor({ name: `${BOT_NAME} Lyrics`, iconURL: client.user.displayAvatarURL() })
+    .setThumbnail(song.artwork || null);
+
+  if (lyrics.length <= 4096) {
+    embed.setDescription(lyrics);
+    return message.reply({ embeds: [embed] }).catch(() => {});
+  }
+
+  embed.setDescription(lyrics.slice(0, 4000) + "\n…");
+  const query = encodeURIComponent(`${artist} ${title} lyrics`.trim());
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setURL(`https://www.google.com/search?q=${query}`).setLabel("Full Lyrics").setStyle(ButtonStyle.Link),
+  );
+  return message.reply({ embeds: [embed], components: [row] }).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Auto-leave when the bot is alone / idle (ported from Lunox
+// events/bot/guild/voiceStateUpdate.js). Disabled while 24/7 mode is on.
+// ---------------------------------------------------------------------------
+const autoLeaveTimers = new Map();
+
+function cancelAutoLeave(guildId) {
+  const t = autoLeaveTimers.get(guildId);
+  if (t) {
+    clearTimeout(t);
+    autoLeaveTimers.delete(guildId);
+  }
+}
+
+function scheduleAutoLeave(guildId) {
+  if (autoLeaveTimers.has(guildId)) return;
+  const timer = setTimeout(() => {
+    autoLeaveTimers.delete(guildId);
+    const gq = getQueue(guildId);
+    const guild = client.guilds.cache.get(guildId);
+    const botMember = guild && guild.members ? guild.members.me : null;
+    const channel = botMember && botMember.voice ? botMember.voice.channel : null;
+    if (!channel || is247On(guildId)) return;
+
+    const alone = channel.members.filter((m) => !m.user.bot).size === 0;
+    const notPlaying = !gq || gq.songs.length === 0;
+    if (!alone && !notPlaying) return;
+
+    const textChannel = gq ? gq.textChannel : null;
+    if (gq) destroyQueue(guildId, gq);
+    else botMember.voice.disconnect("Inactivity").catch(() => {});
+
+    if (textChannel) {
+      safeSend(textChannel, { content: "🔌 Left the voice channel due to inactivity — use `/247` to keep me connected." });
+    }
+  }, LEAVE_TIMEOUT);
+  autoLeaveTimers.set(guildId, timer);
+}
+
+function handleVoiceStateUpdate(oldState, newState) {
+  try {
+    const guild = oldState.guild || newState.guild;
+    const guildId = guild.id;
+    const botMember = guild.members ? guild.members.me : null;
+    if (!botMember) return;
+    const botChannelId = botMember.voice ? botMember.voice.channelId : null;
+
+    // Stage channels: ask to speak automatically (ported from Lunox).
+    if (newState.channelId && newState.channel && newState.channel.type === ChannelType.GuildStageVoice && botMember.voice.suppress) {
+      try {
+        const perms = newState.channel.permissionsFor(botMember);
+        if (tryHas(botMember.permissions, "Speak") || (perms && perms.has("Speak"))) {
+          botMember.voice.setSuppressed(false).catch(() => {});
+        }
+      } catch { /* ignore */ }
+    }
+
+    // The bot itself was disconnected (kicked or moved out) — drop its state.
+    if (oldState.id === client.user?.id && !newState.channelId) {
+      const q = getQueue(guildId);
+      if (q) destroyQueue(guildId, q);
+      cancelAutoLeave(guildId);
+      return;
+    }
+
+    if (!botChannelId) {
+      cancelAutoLeave(guildId);
+      return;
+    }
+
+    const touches = oldState.channelId === botChannelId || newState.channelId === botChannelId;
+    if (!touches) return;
+    if (is247On(guildId)) {
+      cancelAutoLeave(guildId);
+      return;
+    }
+
+    const q = getQueue(guildId);
+    const alone = botMember.voice.channel
+      ? botMember.voice.channel.members.filter((m) => !m.user.bot).size === 0
+      : true;
+    const notPlaying = !q || q.songs.length === 0;
+
+    if (alone || notPlaying) scheduleAutoLeave(guildId);
+    else cancelAutoLeave(guildId);
+  } catch (e) {
+    console.error("voiceStateUpdate error:", e);
+  }
+}
+
+// Reconnects to the saved voice channel on startup while 24/7 mode is on.
+async function rejoin247Guilds() {
+  for (const [guildId, settings] of Object.entries(guildSettings)) {
+    if (!settings || !settings.reconnect || !settings.reconnect.status) continue;
+    try {
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild || (guild.members.me && guild.members.me.voice.channelId)) continue;
+      const vc = settings.reconnect.voice ? guild.channels.cache.get(settings.reconnect.voice) : null;
+      if (!vc || (vc.type !== ChannelType.GuildVoice && vc.type !== ChannelType.GuildStageVoice)) continue;
+      const q = getQueue(guildId) || createQueue(guildId);
+      const textCh = settings.reconnect.text ? guild.channels.cache.get(settings.reconnect.text) : null;
+      if (textCh) q.textChannel = textCh;
+      const conn = connectVoice(guildId, vc, guild.voiceAdapterCreator);
+      if (!conn) continue;
+      await entersState(conn, VoiceConnectionStatus.Ready, 20000);
+      console.log(`24/7: reconnected to ${guild.name} → ${vc.name}`);
+    } catch (e) {
+      console.error(`24/7 rejoin failed for ${guildId}:`, e.message);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Command permissions (ported from Lunox functions/getPermission.js)
+// ---------------------------------------------------------------------------
+const BOT_CHANNEL_PERMS = ["ViewChannel", "SendMessages", "EmbedLinks", "ReadMessageHistory"];
+
+// voice: user must be in a voice channel
+// player: a queue must exist and the user must be in the bot's voice channel
+// current: something must be queued
+// user: Discord permissions the invoker needs
+const COMMAND_RULES = {
+  play: { voice: true },
+  skip: { voice: true, player: true, current: true },
+  stop: { voice: true, player: true },
+  pause: { voice: true, player: true, current: true },
+  resume: { voice: true, player: true, current: true },
+  queue: {},
+  loop: { voice: true, player: true, current: true },
+  volume: { voice: true, player: true },
+  remove: { voice: true, player: true },
+  clear: { voice: true, player: true },
+  nowplaying: {},
+  shuffle: { voice: true, player: true, current: true },
+  previous: { voice: true, player: true, current: true },
+  join: { voice: true },
+  leave: { voice: true, player: true, user: ["ManageGuild"] },
+  autoplay: { voice: true, player: true },
+  "247": { voice: true, user: ["ManageGuild"] },
+  lyric: { voice: true, player: true, current: true },
+  help: {},
+};
+
+function tryHas(perms, flag) {
+  try {
+    return perms ? perms.has(flag) : false;
+  } catch {
+    return false;
+  }
+}
+
+function denyPermission(ctx, text) {
+  ctx.reply({ content: text, flags: 64 }).catch(() => {});
+  return false;
+}
+
+// Returns true when the command may run, otherwise replies ephemerally and
+// returns false.
+function checkCommandPermission(ctx, name) {
+  const rule = COMMAND_RULES[name] || {};
+  const guild = ctx.guild;
+  const member = ctx.member;
+  const botMember = guild && guild.members ? guild.members.me : null;
+
+  if (guild && botMember && ctx.channel && typeof ctx.channel.permissionsFor === "function") {
+    const perms = ctx.channel.permissionsFor(botMember);
+    if (perms) {
+      const missing = BOT_CHANNEL_PERMS.filter((p) => !perms.has(p));
+      if (missing.length) {
+        return denyPermission(ctx, `❌ I'm missing \`${missing.join(", ")}\` in this channel — check my role and channel overwrites.`);
+      }
+    }
+  }
+
+  if (rule.user && rule.user.length && member) {
+    const missing = rule.user.filter((p) => !tryHas(member.permissions, p));
+    if (missing.length) {
+      return denyPermission(ctx, `❌ You need the \`${missing.join(", ")}\` permission to use this command.`);
+    }
+  }
+
+  if (rule.voice) {
+    const vc = member && member.voice ? member.voice.channel : null;
+    if (!vc) return denyPermission(ctx, "❌ You need to join a voice channel first.");
+
+    if (botMember) {
+      let channelPerms = null;
+      try { channelPerms = botMember.permissionsIn(vc.id); } catch { channelPerms = null; }
+      const has = (flag) => tryHas(botMember.permissions, flag) && (channelPerms ? tryHas(channelPerms, flag) : true);
+
+      for (const flag of ["Connect", "Speak"]) {
+        if (!has(flag)) return denyPermission(ctx, `❌ I don't have the \`${flag}\` permission in your voice channel.`);
+      }
+      if (vc.type === ChannelType.GuildStageVoice) {
+        for (const flag of ["RequestToSpeak", "PrioritySpeaker"]) {
+          if (!has(flag)) return denyPermission(ctx, `❌ I don't have the \`${flag}\` permission in your stage channel.`);
+        }
+      }
+    }
+  }
+
+  if (rule.player || rule.current) {
+    const q = guild ? getQueue(guild.id) : null;
+    if (!q) return denyPermission(ctx, "❌ There is no player in this server.");
+    if (rule.player && member && member.voice && member.voice.channelId !== (q.voiceChannel ? q.voiceChannel.id : null)) {
+      return denyPermission(ctx, "❌ You need to join the same voice channel as the bot.");
+    }
+    if (rule.current && q.songs.length === 0) {
+      return denyPermission(ctx, "❌ There is no song currently playing in this server.");
+    }
+  }
+
+  return true;
+}
+
+const VOICE_COMMANDS = new Set(Object.keys(COMMAND_RULES).filter((k) => COMMAND_RULES[k].voice));
 
 function interactionCtx(interaction) {
   let responded = false;
@@ -1173,18 +2124,22 @@ function interactionCtx(interaction) {
     guild: interaction.guild,
     member: interaction.member,
     author: interaction.user,
+    user: interaction.user,
     reply,
-    channel: {
+    // Real channel object when available (so permission checks and sends work),
+    // falling back to a reply-based shim for channels we can't see.
+    channel: interaction.channel || {
+      id: interaction.channelId,
       send: (payload) => {
         const data = typeof payload === "string" ? { content: payload } : payload;
-        if (interaction.channel) return interaction.channel.send(data);
-        return reply(payload);
+        return reply(data);
       },
     },
   };
 }
 
 async function handleInteraction(interaction) {
+  if (interaction.isButton()) return handleForeignButton(interaction);
   if (!interaction.isChatInputCommand()) return;
   const name = interaction.commandName;
 
@@ -1192,11 +2147,12 @@ async function handleInteraction(interaction) {
     return interaction.reply({ content: "❌ This command only works in a server.", flags: 64 }).catch(() => {});
   }
 
-  if (VOICE_COMMANDS.has(name) && !interaction.member?.voice?.channel) {
-    return interaction.reply({ content: "❌ You need to be in a voice channel to use this command!", flags: 64 }).catch(() => {});
-  }
+  const ctx = interactionCtx(interaction);
 
-  if (name === "play") {
+  // Permission checks (channel perms, voice, player state, required roles).
+  if (!checkCommandPermission(ctx, name)) return;
+
+  if (name === "play" || name === "lyric") {
     try {
       await interaction.deferReply();
     } catch (e) {
@@ -1204,8 +2160,6 @@ async function handleInteraction(interaction) {
       return;
     }
   }
-
-  const ctx = interactionCtx(interaction);
 
   try {
     switch (name) {
@@ -1222,6 +2176,13 @@ async function handleInteraction(interaction) {
       case "remove": handleRemoveCommand(ctx, [String(interaction.options.getInteger("number", true))]); break;
       case "clear": handleClearCommand(ctx); break;
       case "nowplaying": handleNowPlayingCommand(ctx); break;
+      case "shuffle": handleShuffleCommand(ctx); break;
+      case "previous": handlePreviousCommand(ctx); break;
+      case "join": await handleJoinCommand(ctx); break;
+      case "leave": handleLeaveCommand(ctx); break;
+      case "autoplay": handleAutoplayCommand(ctx); break;
+      case "247": handle247Command(ctx); break;
+      case "lyric": await handleLyricCommand(ctx); break;
       case "help": handleHelpCommand(ctx); break;
       default:
         interaction.reply({ content: "❌ Unknown command.", flags: 64 }).catch(() => {});
@@ -1232,6 +2193,21 @@ async function handleInteraction(interaction) {
     if (interaction.deferred || interaction.replied) interaction.followUp(payload).catch(() => {});
     else interaction.reply(payload).catch(() => {});
   }
+}
+
+// Buttons owned by a message collector (now-playing controls, queue pages)
+// are answered by that collector. If nothing answers — because the collector
+// expired along with the message — reply so Discord doesn't show a failure.
+function handleForeignButton(interaction) {
+  const id = interaction.customId || "";
+  if (!id.startsWith("np_") && !id.startsWith("page_")) {
+    return interaction.reply({ content: "❌ That button has expired.", flags: 64 }).catch(() => {});
+  }
+  setTimeout(() => {
+    if (!interaction.replied && !interaction.deferred) {
+      interaction.reply({ content: "⚠️ This control has expired — use a slash command instead.", flags: 64 }).catch(() => {});
+    }
+  }, 2500);
 }
 
 function applyPresence() {
@@ -1307,7 +2283,10 @@ async function startBot() {
     } catch (e) {
       console.error("Failed to register slash commands:", e);
     }
+    rejoin247Guilds().catch((e) => console.error("24/7 rejoin failed:", e));
   });
+
+  client.on("voiceStateUpdate", handleVoiceStateUpdate);
 
   client.on("shardReady", () => applyPresence());
   client.on("shardDisconnect", (info) => console.warn("Shard disconnected:", info));
@@ -1329,8 +2308,21 @@ async function startBot() {
   login();
 }
 
-process.on("uncaughtException", (err) => console.error("Uncaught exception:", err));
-process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
+// ---------------------------------------------------------------------------
+// Anticrash (ported from Lunox handlers/anticrash.js): log fatal errors with
+// their origin instead of letting the process die silently.
+// ---------------------------------------------------------------------------
+function setupAnticrash() {
+  const log = (label, err, origin) => {
+    console.error(`[anticrash] ${label}:`, err instanceof Error ? err.stack || err.message : err, origin ? `(origin: ${origin})` : "");
+  };
+  process.on("uncaughtException", (err, origin) => log("uncaughtException", err, origin));
+  process.on("uncaughtExceptionMonitor", (err, origin) => log("uncaughtExceptionMonitor", err, origin));
+  process.on("unhandledRejection", (reason) => log("unhandledRejection", reason));
+  process.on("rejectionHandled", (promise) => log("rejectionHandled", promise));
+}
+
+setupAnticrash();
 
 // ---------------------------------------------------------------------------
 // Express dashboard
@@ -1576,9 +2568,8 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
     case "stop":
       if (!q) return res.status(400).json({ error: "Nothing playing" });
       q.songs = [];
-      queue.delete(guildId);
+      destroyQueue(guildId, q);
       if (q.player) q.player.stop(true);
-      destroyVoice(q);
       break;
     case "loop":
       if (!q) return res.status(400).json({ error: "No queue" });
@@ -1590,20 +2581,23 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
       if (isNaN(idx) || idx < 0 || idx >= q.songs.length) return res.status(400).json({ error: "Invalid index" });
       q.songs.splice(idx, 1);
       if (idx === 0) {
-        const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
-        if (active) q._advanceMode = "keep";
-        if (q.player) q.player.stop(true);
-        if (q.songs.length === 0) destroyQueue(guildId, q);
-        else if (!active && !q._starting) play(guildId).catch(() => {});
+        if (q.songs.length === 0) {
+          destroyQueue(guildId, q);
+          if (q.player) q.player.stop(true);
+        } else {
+          const active = q.player && q.player.state.status !== AudioPlayerStatus.Idle;
+          if (active) q._advanceMode = "keep";
+          if (q.player) q.player.stop(true);
+          else if (!q._starting) play(guildId).catch(() => {});
+        }
       }
       break;
     }
     case "clear":
       if (!q) return res.status(400).json({ error: "No queue" });
       q.songs = [];
-      queue.delete(guildId);
+      destroyQueue(guildId, q);
       if (q.player) q.player.stop(true);
-      destroyVoice(q);
       break;
     case "volume": {
       if (!q) return res.status(400).json({ error: "No queue" });
@@ -1643,17 +2637,29 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
             url: null,
             title: t.title,
             artist: t.artist,
+            duration: t.duration || null,
             search: spotifySearchQuery(t),
             source: "spotify",
+            requester: "Dashboard",
+            requesterId: null,
           }));
         } else {
-          const resolved = await resolveVideo(query);
-          label = resolved.title;
-          entries = [{ url: resolved.url, title: resolved.title, source: resolved.source || "youtube", client: resolved.client }];
+          // Enqueue the raw query — no yt-dlp round-trip before responding.
+          // The title and duration arrive with the stream itself.
+          const direct = isYouTubeUrl(query) || isSoundCloudUrl(query);
+          entries = [{
+            url: direct ? query : null,
+            search: direct ? null : query,
+            title: query,
+            source: isSoundCloudUrl(query) ? "soundcloud" : "youtube",
+            requester: "Dashboard",
+            requesterId: null,
+          }];
         }
         const qq = getQueue(guildId);
         if (!qq) return res.status(400).json({ error: "Queue was cleared while resolving — try again" });
         for (const entry of entries) qq.songs.push(entry);
+        prewarmNext(guildId);
         if (qq.player && qq.player.state.status === AudioPlayerStatus.Idle && !qq._starting) {
           play(guildId).catch(() => {});
         }
@@ -1669,7 +2675,12 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", discord: client.isReady() ? "online" : "offline" });
+  res.status(200).json({
+    status: "ok",
+    discord: client.isReady() ? "online" : "offline",
+    lastStreamStart,
+    uptimeSec: Math.round(process.uptime()),
+  });
 });
 
 app.get("/robots.txt", (req, res) => {

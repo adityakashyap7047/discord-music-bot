@@ -8,12 +8,19 @@ A Discord music bot with a web dashboard, built with discord.js, yt-dlp, and FFm
 - Automatic SoundCloud fallback when YouTube bot-checks the server's IP
 - Play Spotify links — tracks, albums, and playlists (up to 50 tracks per link)
 - Resilient playback: yt-dlp is piped straight through FFmpeg, so a stream hiccup never leaves the channel silent
-- Play Spotify links — tracks, albums, and playlists (up to 50 tracks per link)
 - Queue management
 - Skip, stop, pause, resume
 - Volume control
 - Loop mode
 - Remove songs from queue
+- Interactive now-playing message with control buttons (pause, volume, loop, shuffle, previous, skip, stop)
+- Paginated `/queue` with button navigation
+- `/shuffle` and `/previous`
+- Autoplay — auto-queues similar tracks when the queue runs dry
+- 24/7 mode — stays in voice when idle and reconnects after a restart
+- `/lyric` lookup for the current song
+- Auto-leave after inactivity (disabled while 24/7 mode is on)
+- Command permission checks (voice channel, same-VC-as-bot, Manage Guild, missing bot permissions)
 - Web dashboard with Discord OAuth2 login
 - Real-time status API and health endpoint
 
@@ -61,6 +68,9 @@ npm run dev
 | `YTDLP_COOKIES_FROM_BROWSER` | Optional — e.g. `chrome`, logs yt-dlp in with browser cookies (local use) |
 | `YTDLP_CLIENTS` | Optional — comma-separated yt-dlp player clients tried on bot checks |
 | `KEEP_ALIVE_URL` | Optional — public URL of this bot; pinged every 10 min so a free host never sleeps |
+| `LEAVE_TIMEOUT` | Optional — ms of inactivity before the bot leaves voice (default `60000`; ignored while `/247` is on) |
+| `EMBED_COLOR` | Optional — embed accent colour as hex without `#` (default `5865F2`) |
+| `DATA_DIR` | Optional — folder for `guild-settings.json` (24/7 + autoplay state); point at a persistent disk to survive redeploys |
 
 ## Commands
 
@@ -79,7 +89,18 @@ Slash commands (type `/` in Discord):
 | `/remove <number>` | Remove song from queue |
 | `/clear` | Clear queue |
 | `/nowplaying` | Show currently playing |
+| `/shuffle` | Shuffle the queue (keeps the current song first) |
+| `/previous` | Play the previous song |
+| `/join` | Join your voice channel |
+| `/leave` | Leave voice and stop playback (Manage Server) |
+| `/autoplay` | Toggle autoplay — auto-queue similar tracks when the queue empties |
+| `/247` | Toggle 24/7 mode — stay in voice when idle, reconnect on restart (Manage Server) |
+| `/lyric` | Lyrics for the current song |
 | `/help` | List all commands |
+
+Playback-control commands (`/skip`, `/stop`, `/pause`, `/resume`, `/loop`, `/volume`, `/remove`, `/clear`, `/shuffle`, `/previous`, `/lyric`, …) require you to be in the **same voice channel as the bot**, matching the permission model in [Lunox](https://github.com/adh319/Lunox). `/leave` and `/247` additionally require **Manage Server**.
+
+The now-playing message has buttons for pause/resume, volume up/down, loop, shuffle, previous, skip, and stop — only the requester of the current song (or a member with Manage Server) can press them.
 
 ## Spotify
 
