@@ -3,13 +3,19 @@ services:
     name: discord-music-bot
     runtime: node
     plan: starter
-    buildCommand: npm install && curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp && chmod a+rx yt-dlp
+    buildCommand: |
+      npm install &&
+      apt-get update && apt-get install -y --no-install-recommends ffmpeg &&
+      curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /opt/render/project/src/yt-dlp &&
+      chmod a+rx /opt/render/project/src/yt-dlp
     startCommand: npm start
     envVars:
       - key: PORT
         value: "3000"
       - key: NODE_VERSION
         value: "22.12.0"
+      - key: YTDLP_PATH
+        value: "/opt/render/project/src/yt-dlp"
       - key: DISCORD_TOKEN
         sync: false
       - key: DISCORD_CLIENT_ID

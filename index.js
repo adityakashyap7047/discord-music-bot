@@ -17,6 +17,105 @@ const BASE_URL = process.env.BASE_URL || "";
 const BOT_NAME = "NOTIXMIX";
 const START_TIME = Date.now();
 
+// ---------------------------------------------------------------------------
+// Rate-limited yt-dlp request queue
+// Prevents YouTube 429 (Too Many Requests) by serializing and throttling
+// yt-dlp calls with a configurable cooldown between requests.
+// ---------------------------------------------------------------------------
+const YTDLP_MAX_CONCURRENT = 2;          // max simultaneous yt-dlp processes
+const YTDLP_COOLDOWN_MS = 1500;           // min ms between launching new yt-dlp calls
+let ytdlpActiveCount = 0;
+let ytdlpLastCall = 0;
+const ytdlpPendingQueue = [];             // { resolve, reject, args, timeout }
+
+function enqueueYtDlp(args, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    ytdlpPendingQueue.push({ resolve, reject, args, timeout });
+    drainYtDlpQueue();
+  });
+}
+
+async function drainYtDlpQueue() {
+  if (ytdlpActiveCount >= YTDLP_MAX_CONCURRENT || ytdlpPendingQueue.length === 0) return;
+  const now = Date.now();
+  const wait = YTDLP_COOLDOWN_MS - (now - ytdlpLastCall);
+  if (wait > 0) {
+    setTimeout(() => drainYtDlpQueue(), wait);
+    return;
+  }
+  const job = ytdlpPendingQueue.shift();
+  if (!job) return;
+  ytdlpActiveCount++;
+  ytdlpLastCall = Date.now();
+  try {
+    const result = await runYtDlpRaw(job.args, job.timeout);
+    job.resolve(result);
+  } catch (e) {
+    job.reject(e);
+  } finally {
+    ytdlpActiveCount--;
+    // Small delay before draining the next item to space out calls
+    setTimeout(() => drainYtDlpQueue(), YTDLP_COOLDOWN_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Discord message queue — sends messages sequentially per channel to avoid
+// hitting Discord's per-channel rate limit and ensures messages arrive in
+// the correct order.
+// ---------------------------------------------------------------------------
+const channelMessageQueues = new Map(); // channelId -> { queue: [], processing: bool }
+
+function safeSend(channel, payload) {
+  if (!channel || typeof channel.send !== "function") return Promise.resolve();
+  const channelId = channel.id || "unknown";
+  if (!channelMessageQueues.has(channelId)) {
+    channelMessageQueues.set(channelId, { queue: [], processing: false });
+  }
+  const q = channelMessageQueues.get(channelId);
+  return new Promise((resolve) => {
+    q.queue.push({ payload, resolve });
+    processChannelQueue(channelId);
+  });
+}
+
+async function processChannelQueue(channelId) {
+  const q = channelMessageQueues.get(channelId);
+  if (!q || q.processing || q.queue.length === 0) return;
+  q.processing = true;
+  while (q.queue.length > 0) {
+    const { payload, resolve } = q.queue.shift();
+    try {
+      // Find the channel object from the client cache
+      const data = typeof payload === "string" ? { content: payload } : payload;
+      const channel = client.channels?.cache?.get(channelId);
+      if (channel && typeof channel.send === "function") {
+        await channel.send(data);
+      }
+    } catch (err) {
+      // If we hit a rate limit, wait for the retry-after duration
+      if (err?.status === 429 || err?.httpStatus === 429) {
+        const retryAfter = (err.retryAfter || 2) * 1000;
+        console.warn(`Discord rate limit on channel ${channelId}, waiting ${retryAfter}ms`);
+        await new Promise((r) => setTimeout(r, retryAfter));
+      } else {
+        console.error("safeSend error:", err.message || err);
+      }
+    }
+    // Small spacing between messages to stay well under rate limits
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  q.processing = false;
+  // Clean up empty queues to prevent memory leak
+  if (q.queue.length === 0) channelMessageQueues.delete(channelId);
+}
+
+// ---------------------------------------------------------------------------
+// Per-guild play command cooldown
+// ---------------------------------------------------------------------------
+const guildPlayCooldowns = new Map();     // guildId -> timestamp of last /play
+const PLAY_COOLDOWN_MS = 3000;            // 3 seconds between /play per guild
+
 const SLASH_COMMANDS = [
   { name: "play", description: "Play a YouTube video or search query", options: [{ type: ApplicationCommandOptionType.String, name: "query", description: "YouTube URL or search terms", required: true }] },
   { name: "skip", description: "Skip the current song" },
@@ -38,15 +137,55 @@ function resolveYtDlp() {
   if (fs.existsSync(local)) return local;
   return "yt-dlp";
 }
-const YTDLP = resolveYtDlp();
+let YTDLP = resolveYtDlp();
 
-function runYtDlp(args, timeout = 30000) {
+// Auto-download yt-dlp if missing at runtime (Linux only — for Render/Docker)
+async function ensureYtDlp() {
+  // Quick check — can we actually run the resolved binary?
+  try {
+    const { execFileSync } = require("child_process");
+    execFileSync(YTDLP, ["--version"], { timeout: 10000 });
+    console.log(`yt-dlp found at: ${YTDLP}`);
+    return; // works fine
+  } catch {
+    // Not found or not executable — try to download
+  }
+
+  if (process.platform === "win32") {
+    console.error("yt-dlp.exe not found — please download it and place it in the project folder.");
+    return;
+  }
+
+  const dest = path.join(__dirname, "yt-dlp");
+  console.log("yt-dlp not found — downloading latest release...");
+  try {
+    const { execSync } = require("child_process");
+    execSync(
+      `curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${dest}" && chmod a+rx "${dest}"`,
+      { timeout: 60000, stdio: "inherit" }
+    );
+    if (fs.existsSync(dest)) {
+      YTDLP = dest;
+      console.log(`yt-dlp downloaded to: ${YTDLP}`);
+    }
+  } catch (e) {
+    console.error("Failed to auto-download yt-dlp:", e.message);
+  }
+}
+
+// Raw yt-dlp execution — called only via the rate-limited queue
+function runYtDlpRaw(args, timeout = 30000) {
   return new Promise((resolve, reject) => {
     execFile(YTDLP, ["--no-warnings", ...args], { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
       if (err) reject(new Error(stderr || err.message));
       else resolve(stdout.trim());
     });
   });
+}
+
+// Public interface — all yt-dlp calls go through the rate-limited queue
+function runYtDlp(args, timeout = 30000) {
+  return enqueueYtDlp(args, timeout);
 }
 
 function isYouTubeUrl(s) {
@@ -110,13 +249,130 @@ function describeYtDlpError(msg) {
   return "Couldn't fetch that track — try again in a few seconds.";
 }
 
+// ---------------------------------------------------------------------------
+// Spotify support
+// Spotify links are resolved to track metadata (no API key needed) via the
+// public embed page, then each track is played through a YouTube search.
+// ---------------------------------------------------------------------------
+const SPOTIFY_MAX_TRACKS = 50;
+const SPOTIFY_EMBED_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+function isSpotifyLink(s) {
+  const v = String(s || "").trim();
+  return /^spotify:(track|album|playlist|episode|show):/i.test(v) ||
+    /^https?:\/\/(open\.spotify\.com|play\.spotify\.com|spotify\.link)\/\S+/i.test(v);
+}
+
+function parseSpotifyUrl(input) {
+  const s = String(input || "").trim();
+  const uri = s.match(/^spotify:(track|album|playlist|episode|show):([A-Za-z0-9]+)$/i);
+  if (uri) return { type: uri[1].toLowerCase(), id: uri[2] };
+  const m = s.match(/^https?:\/\/(?:open|play)\.spotify\.com\/(?:intl-[a-z-]+\/)?(track|album|playlist|episode|show)\/([A-Za-z0-9]+)/i);
+  if (m) return { type: m[1].toLowerCase(), id: m[2] };
+  return null;
+}
+
+function httpGetText(url, redirects = 5) {
+  return new Promise((resolve, reject) => {
+    if (redirects <= 0) return reject(new Error("Too many redirects"));
+    const lib = url.startsWith("http:") ? require("http") : https;
+    const req = lib.get(url, { headers: { "User-Agent": SPOTIFY_EMBED_UA, Accept: "text/html,application/json,*/*" } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        return httpGetText(next, redirects - 1).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { body += c; });
+      res.on("end", () => resolve({ body, finalUrl: url }));
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.setTimeout(20000, () => req.destroy(new Error("Spotify request timed out")));
+  });
+}
+
+function extractSpotifyEntity(html) {
+  const m = String(html).match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) return null;
+  try {
+    const data = JSON.parse(m[1]);
+    return data?.props?.pageProps?.state?.data?.entity || null;
+  } catch {
+    return null;
+  }
+}
+
+function spotifySearchQuery(track) {
+  return track.artist ? `${track.artist} - ${track.title}` : track.title;
+}
+
+// Resolves a Spotify track/album/playlist link into playable track metadata.
+async function resolveSpotify(input) {
+  const raw = String(input || "").trim();
+  let ref = parseSpotifyUrl(raw);
+  if (!ref) {
+    // Short link (spotify.link/...) — follow the redirect to the real URL
+    let finalUrl;
+    try {
+      ({ finalUrl } = await httpGetText(raw));
+    } catch {
+      throw new Error("Couldn't reach that Spotify link — try again in a few seconds.");
+    }
+    ref = parseSpotifyUrl(finalUrl);
+    if (!ref) throw new Error("That Spotify link isn't a track, album, or playlist.");
+  }
+  if (ref.type === "episode" || ref.type === "show") {
+    throw new Error("Podcasts aren't supported — paste a Spotify track, album, or playlist link instead.");
+  }
+
+  let body;
+  try {
+    ({ body } = await httpGetText(`https://open.spotify.com/embed/${ref.type}/${ref.id}`));
+  } catch {
+    throw new Error("Couldn't reach Spotify right now — try again in a few seconds.");
+  }
+
+  const entity = extractSpotifyEntity(body);
+  if (!entity) throw new Error("Couldn't read that Spotify link — it may be private or unavailable.");
+
+  if (entity.type === "track" || ref.type === "track") {
+    const artist = (entity.artists || []).map((a) => a?.name).filter(Boolean).join(", ");
+    const title = entity.name || entity.title;
+    if (!title) throw new Error("Couldn't read that track from Spotify.");
+    return { kind: "track", title, total: 1, tracks: [{ title, artist }] };
+  }
+
+  const list = Array.isArray(entity.trackList) ? entity.trackList : [];
+  const container = entity.title || entity.name || (ref.type === "album" ? "Album" : "Playlist");
+  const all = list
+    .filter((t) => t && t.title && (!t.entityType || t.entityType === "track"))
+    .map((t) => ({ title: t.title, artist: t.subtitle || "" }));
+  if (all.length === 0) {
+    throw new Error(`No playable tracks found in that Spotify ${ref.type}.`);
+  }
+  return {
+    kind: ref.type,
+    title: container,
+    total: all.length,
+    tracks: all.slice(0, SPOTIFY_MAX_TRACKS),
+  };
+}
+
 async function getStreamUrl(url, retries = 2) {
   try {
     const out = await runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
     return out.split(/\r?\n/)[0] || out;
   } catch (e) {
     if (retries > 0) {
-      await new Promise((r) => setTimeout(r, 1500));
+      // Exponential backoff: wait longer on each retry
+      const delay = 2000 * (3 - retries);
+      await new Promise((r) => setTimeout(r, delay));
       return getStreamUrl(url, retries - 1);
     }
     throw e;
@@ -201,7 +457,7 @@ async function play(guildId) {
     q._starting = false;
     destroyQueue(guildId, q);
     if (q.textChannel) {
-      q.textChannel.send("❌ Lost the voice connection — stopped playback.").catch(() => {});
+      safeSend(q.textChannel, "❌ Lost the voice connection — stopped playback.");
     }
     return;
   }
@@ -212,7 +468,7 @@ async function play(guildId) {
     if (getQueue(guildId) === q) {
       destroyQueue(guildId, q);
       if (q.textChannel) {
-        q.textChannel.send("❌ Could not connect to the voice channel — stopped playback.").catch(() => {});
+        safeSend(q.textChannel, "❌ Could not connect to the voice channel — stopped playback.");
       }
     }
     return;
@@ -222,6 +478,22 @@ async function play(guildId) {
   let remote = null;
 
   try {
+    // Spotify tracks are queued without a stream URL — resolve the YouTube
+    // match lazily right before playback so big playlists load instantly.
+    if (!song.url) {
+      const resolved = await resolveVideo(song.search || song.title);
+      if (getQueue(guildId) !== q) {
+        q._starting = false;
+        return;
+      }
+      if (q.songs[0] !== song) {
+        q._starting = false;
+        play(guildId).catch(() => {});
+        return;
+      }
+      song.url = resolved.url;
+    }
+
     const streamUrl = await getStreamUrl(song.url);
     if (getQueue(guildId) !== q) {
       q._starting = false;
@@ -271,7 +543,7 @@ async function play(guildId) {
       if (!q._announceNext) return;
       q._announceNext = false;
       if (q.textChannel) {
-        q.textChannel.send({ content: `🎵 Now playing: **${song.title}**` }).catch(() => {});
+        safeSend(q.textChannel, { content: `🎵 Now playing: **${song.title}**` });
       }
     });
 
@@ -282,7 +554,7 @@ async function play(guildId) {
       // even when loop is enabled (and does not advance twice).
       if (!q._advanceMode) q._advanceMode = "force";
       if (q.textChannel) {
-        q.textChannel.send({ content: `⚠️ Playback error on **${song.title}** — skipping.` }).catch(() => {});
+        safeSend(q.textChannel, { content: `⚠️ Playback error on **${song.title}** — skipping.` });
       }
     });
 
@@ -305,7 +577,7 @@ async function play(guildId) {
       return;
     }
     if (q.textChannel) {
-      q.textChannel.send({ content: `⚠️ Skipping **${song.title}** — ${describeYtDlpError(e.message)}` }).catch(() => {});
+      safeSend(q.textChannel, { content: `⚠️ Skipping **${song.title}** — ${describeYtDlpError(e.message)}` });
     }
     if (q.songs[0] === song) q.songs.shift();
     q._advanceMode = null;
@@ -315,10 +587,10 @@ async function play(guildId) {
   q._starting = false;
 }
 
-function addSongToQueue(guildId, url, title, textChannel) {
+function addSongToQueue(guildId, songs, textChannel) {
   const q = getQueue(guildId) || createQueue(guildId);
   if (!q.textChannel) q.textChannel = textChannel;
-  q.songs.push({ url, title });
+  for (const song of songs) q.songs.push(song);
   return q;
 }
 
@@ -353,7 +625,7 @@ function setupVoiceConnection(guildId, voiceChannel, message) {
   }
 }
 
-function handlePlayCommand(message, args) {
+async function handlePlayCommand(message, args) {
   const guildId = message.guild.id;
   const textChannel = message.channel;
   const voiceChannel = message.member?.voice?.channel;
@@ -365,46 +637,48 @@ function handlePlayCommand(message, args) {
     return message.reply("❌ Please provide a YouTube URL or search query!").catch(() => {});
   }
 
-  const command = async () => {
-    const query = args.join(" ");
-    let url;
-    let title;
+  // Per-guild cooldown to prevent spamming /play
+  const now = Date.now();
+  const lastPlay = guildPlayCooldowns.get(guildId) || 0;
+  if (now - lastPlay < PLAY_COOLDOWN_MS) {
+    const wait = Math.ceil((PLAY_COOLDOWN_MS - (now - lastPlay)) / 1000);
+    return message.reply(`⏳ Please wait ${wait}s before using /play again.`).catch(() => {});
+  }
+  guildPlayCooldowns.set(guildId, now);
+
+  const query = args.join(" ");
+  let url;
+  let title;
+  try {
+    const resolved = await resolveVideo(query);
+    url = resolved.url;
+    title = resolved.title;
+  } catch (e) {
+    console.error("Play resolve error:", e.message);
+    return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
+  }
+
+  const q = addSongToQueue(guildId, url, title, textChannel);
+
+  if (q.songs.length === 1) {
+    message.reply(`🎶 **${title}** — joining voice…`).catch(() => {});
+    setupVoiceConnection(guildId, voiceChannel, message);
     try {
-      const resolved = await resolveVideo(query);
-      url = resolved.url;
-      title = resolved.title;
-    } catch (e) {
-      console.error("Play resolve error:", e.message);
-      return message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
+      if (!q.connection) {
+        queue.delete(guildId);
+        message.reply("❌ Could not join voice channel!").catch(() => {});
+        return;
+      }
+      await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+      play(guildId).catch(() => {});
+    } catch {
+      destroyVoice(q);
+      queue.delete(guildId);
+      message.reply("❌ Could not join voice channel!").catch(() => {});
     }
-
-    const q = addSongToQueue(guildId, url, title, textChannel);
-
-    if (q.songs.length === 1) {
-      message.reply(`🎶 **${title}** — joining voice…`).catch(() => {});
-      setupVoiceConnection(guildId, voiceChannel, message);
-      const waitForConnection = async () => {
-        try {
-          if (!q.connection) {
-            queue.delete(guildId);
-            message.reply("❌ Could not join voice channel!").catch(() => {});
-            return;
-          }
-          await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
-          play(guildId).catch(() => {});
-        } catch {
-          destroyVoice(q);
-          queue.delete(guildId);
-          message.reply("❌ Could not join voice channel!").catch(() => {});
-        }
-      };
-      waitForConnection().catch(() => {});
-    } else {
-      textChannel.send({ content: `🎶 Added to queue: **${title}** (${q.songs.length - 1} more in queue)` }).catch(() => {});
-    }
-  };
-
-  command().catch(() => {});
+  } else {
+    safeSend(textChannel, { content: `🎶 Added to queue: **${title}** (${q.songs.length - 1} more in queue)` });
+  }
 }
 
 function handleSkipCommand(message) {
@@ -412,9 +686,12 @@ function handleSkipCommand(message) {
   if (!q || !q.player || q.songs.length === 0 || q.player.state.status === AudioPlayerStatus.Idle) {
     return message.reply("❌ Nothing is playing!").catch(() => {});
   }
+  // Check remaining *before* stop(), because stop() triggers the Idle
+  // handler synchronously which shifts the songs array.
+  const hasMore = q.songs.length > 1;
   q._advanceMode = "force";
   q.player.stop(true);
-  message.reply(q.songs.length === 0 ? "⏭️ Skipped — the queue has finished!" : "⏭️ Skipped!").catch(() => {});
+  message.reply(hasMore ? "⏭️ Skipped!" : "⏭️ Skipped — the queue has finished!").catch(() => {});
 }
 
 function handleStopCommand(message) {
@@ -610,7 +887,9 @@ async function handleInteraction(interaction) {
 
   try {
     switch (name) {
-      case "play": handlePlayCommand(ctx, [interaction.options.getString("query", true)]); break;
+      // handlePlayCommand is async — must be awaited so errors are caught
+      // and the deferred reply is properly resolved
+      case "play": await handlePlayCommand(ctx, [interaction.options.getString("query", true)]); break;
       case "skip": handleSkipCommand(ctx); break;
       case "stop": handleStopCommand(ctx); break;
       case "pause": handlePauseCommand(ctx); break;
@@ -636,10 +915,10 @@ async function handleInteraction(interaction) {
 function applyPresence() {
   if (!client.isReady()) return;
   try {
-    Promise.resolve(client.user.setActivity("Music | /play", { type: ActivityType.Listening }))
-      .catch((err) => console.error("Presence update failed:", err));
-    Promise.resolve(client.user.setStatus("online"))
-      .catch((err) => console.error("Status update failed:", err));
+    client.user.setPresence({
+      activities: [{ name: "Music | /play", type: ActivityType.Listening }],
+      status: "online",
+    });
   } catch (err) {
     console.error("Presence update failed:", err);
   }
@@ -666,7 +945,10 @@ function relogin() {
   setTimeout(login, 5000);
 }
 
-function startBot() {
+async function startBot() {
+  // Ensure yt-dlp is available before accepting commands
+  await ensureYtDlp();
+
   client.on("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
     loginAttempts = 0;
