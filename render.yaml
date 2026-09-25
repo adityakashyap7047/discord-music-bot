@@ -26,5 +26,18 @@ services:
         generateValue: true
       - key: BASE_URL
         sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      # Points at the persistent disk below. If cookies.txt is not uploaded
+      # yet, yt-dlp simply runs without cookies (the path is only used when
+      # the file exists).
+      - key: YTDLP_COOKIES
+        value: "/var/data/cookies.txt"
+    disks:
+      - name: yt-cookies
+        mountPath: /var/data
+        sizeGB: 1
     autoDeployTrigger: commit
     healthCheckPath: /health

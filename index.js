@@ -173,10 +173,22 @@ async function ensureYtDlp() {
   }
 }
 
+// Optional YouTube credentials: a cookies.txt exported from a logged-in
+// browser session is the most reliable way past "not a bot" checks.
+function ytCookieArgs() {
+  if (process.env.YTDLP_COOKIES && fs.existsSync(process.env.YTDLP_COOKIES)) {
+    return ["--cookies", process.env.YTDLP_COOKIES];
+  }
+  if (process.env.YTDLP_COOKIES_FROM_BROWSER) {
+    return ["--cookies-from-browser", process.env.YTDLP_COOKIES_FROM_BROWSER];
+  }
+  return [];
+}
+
 // Raw yt-dlp execution — called only via the rate-limited queue
 function runYtDlpRaw(args, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    execFile(YTDLP, ["--no-warnings", ...args], { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
+    execFile(YTDLP, ["--no-warnings", ...ytCookieArgs(), ...args], { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
       if (err) reject(new Error(stderr || err.message));
       else resolve(stdout.trim());
     });
@@ -188,6 +200,44 @@ function runYtDlp(args, timeout = 30000) {
   return enqueueYtDlp(args, timeout);
 }
 
+// ---------------------------------------------------------------------------
+// YouTube player-client fallback
+// "Sign in to confirm you're not a bot" is checked per player client, so when
+// one client is blocked we retry with the next one in the list.
+// ---------------------------------------------------------------------------
+const TRANSIENT_YT_ERROR = /not a bot|sign in to confirm|too many requests|http error 429|http error 5\d\d|rate.?limit|page needs to be reloaded|please retry/i;
+
+function isTransientYtError(msg) {
+  return TRANSIENT_YT_ERROR.test(String(msg || ""));
+}
+
+function resolveYtClients() {
+  const fallback = process.env.YTDLP_CLIENTS || "android_vr,web_embedded,mweb,tv_embedded";
+  return fallback.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function ytClientArgs(client) {
+  return client ? ["--extractor-args", `youtube:player_client=${client}`] : [];
+}
+
+// Tries the default client first, then each fallback client while YouTube
+// keeps returning bot-check / rate-limit errors. Non-transient errors
+// (private video, bad URL, ...) are thrown immediately.
+async function withYtClients(args, timeout = 30000, runner = runYtDlp) {
+  const clients = [null, ...resolveYtClients()];
+  let lastErr = null;
+  for (let i = 0; i < clients.length; i++) {
+    try {
+      return await runner([...args, ...ytClientArgs(clients[i])], timeout);
+    } catch (e) {
+      lastErr = e;
+      if (!isTransientYtError(e.message)) throw e;
+      if (i < clients.length - 1) await new Promise((r) => setTimeout(r, 750));
+    }
+  }
+  throw lastErr;
+}
+
 function isYouTubeUrl(s) {
   return /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(s);
 }
@@ -195,7 +245,7 @@ function isYouTubeUrl(s) {
 async function resolveVideo(query, retries = 2) {
   const target = isYouTubeUrl(query) ? query : `ytsearch1:${query}`;
   try {
-    const json = await runYtDlp(["-J", "--no-playlist", target]);
+    const json = await withYtClients(["-J", "--no-playlist", target]);
     const info = JSON.parse(json);
     if (!info) throw new Error("No results");
 
@@ -225,7 +275,7 @@ function describeYtDlpError(msg) {
     return "YouTube is rate-limiting this server right now — wait a few seconds and try again.";
   }
   if (/not a bot/i.test(m)) {
-    return "YouTube is asking for bot verification — wait a minute and try again.";
+    return "YouTube is asking for bot verification on this server's IP — it usually clears in a minute. If it keeps happening, set YTDLP_COOKIES in .env to a cookies.txt exported from a logged-in browser.";
   }
   if (/Private video/i.test(m)) return "That video is private.";
   if (/age.restricted|Sign in to confirm your age|inappropriate for some users/i.test(m)) {
@@ -251,11 +301,17 @@ function describeYtDlpError(msg) {
 
 // ---------------------------------------------------------------------------
 // Spotify support
-// Spotify links are resolved to track metadata (no API key needed) via the
-// public embed page, then each track is played through a YouTube search.
+// Metadata comes from Spotify's official Web API (client-credentials flow)
+// when SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET are set, and falls back to
+// the public embed page otherwise. Each track is then matched against
+// YouTube via yt-dlp for playback — Spotify exposes no audio streams.
 // ---------------------------------------------------------------------------
 const SPOTIFY_MAX_TRACKS = 50;
 const SPOTIFY_EMBED_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const SPOTIFY_API = "https://api.spotify.com/v1";
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || "";
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || "";
+const SPOTIFY_USE_API = Boolean(SPOTIFY_CLIENT_ID && SPOTIFY_CLIENT_SECRET);
 
 function isSpotifyLink(s) {
   const v = String(s || "").trim();
@@ -272,29 +328,41 @@ function parseSpotifyUrl(input) {
   return null;
 }
 
-function httpGetText(url, redirects = 5) {
+// Minimal HTTP text request with redirect following. Returns { status, body, finalUrl }.
+function httpRequestText(method, url, { headers = {}, body = null } = {}, redirects = 5) {
   return new Promise((resolve, reject) => {
     if (redirects <= 0) return reject(new Error("Too many redirects"));
     const lib = url.startsWith("http:") ? require("http") : https;
-    const req = lib.get(url, { headers: { "User-Agent": SPOTIFY_EMBED_UA, Accept: "text/html,application/json,*/*" } }, (res) => {
+    const payload = body == null ? null : Buffer.from(String(body), "utf8");
+    const hdrs = Object.assign({ "User-Agent": SPOTIFY_EMBED_UA, Accept: "text/html,application/json,*/*" }, headers);
+    if (payload) hdrs["Content-Length"] = payload.length;
+    const req = lib.request(url, { method, headers: hdrs }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, url).toString();
-        return httpGetText(next, redirects - 1).then(resolve, reject);
+        return httpRequestText(method, next, { headers, body }, redirects - 1).then(resolve, reject);
       }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error(`HTTP ${res.statusCode}`));
-      }
-      let body = "";
+      let out = "";
       res.setEncoding("utf8");
-      res.on("data", (c) => { body += c; });
-      res.on("end", () => resolve({ body, finalUrl: url }));
+      res.on("data", (c) => { out += c; });
+      res.on("end", () => resolve({ status: res.statusCode, body: out, finalUrl: url }));
       res.on("error", reject);
     });
     req.on("error", reject);
     req.setTimeout(20000, () => req.destroy(new Error("Spotify request timed out")));
+    if (payload) req.write(payload);
+    req.end();
   });
+}
+
+async function httpGetText(url, redirects = 5) {
+  const res = await httpRequestText("GET", url, {}, redirects);
+  if (res.status !== 200) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return { body: res.body, finalUrl: res.finalUrl };
 }
 
 function extractSpotifyEntity(html) {
@@ -310,6 +378,110 @@ function extractSpotifyEntity(html) {
 
 function spotifySearchQuery(track) {
   return track.artist ? `${track.artist} - ${track.title}` : track.title;
+}
+
+// --- Official Web API (client-credentials flow) ----------------------------
+let spotifyTokenCache = { value: null, expiresAt: 0 };
+
+async function getSpotifyToken(forceRefresh = false) {
+  if (!forceRefresh && spotifyTokenCache.value && Date.now() < spotifyTokenCache.expiresAt - 60000) {
+    return spotifyTokenCache.value;
+  }
+  const basic = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString("base64");
+  let res;
+  try {
+    res = await httpRequestText("POST", "https://accounts.spotify.com/api/token", {
+      headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" },
+      body: "grant_type=client_credentials",
+    });
+  } catch (e) {
+    throw new Error(`Couldn't reach Spotify's auth server — ${e.message}`);
+  }
+  if (res.status === 400 || res.status === 401) {
+    const err = new Error("Spotify rejected SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET — fix them in your environment.");
+    err.spotifyConfig = true;
+    throw err;
+  }
+  if (res.status !== 200) throw new Error(`Spotify auth failed (HTTP ${res.status}) — try again shortly.`);
+  let data;
+  try {
+    data = JSON.parse(res.body);
+  } catch {
+    throw new Error("Spotify returned an invalid token response.");
+  }
+  if (!data.access_token) throw new Error("Spotify didn't return an access token.");
+  spotifyTokenCache.value = data.access_token;
+  spotifyTokenCache.expiresAt = Date.now() + (Number(data.expires_in) || 3600) * 1000;
+  return spotifyTokenCache.value;
+}
+
+async function spotifyApiGet(pathname, retryAuth = true) {
+  const token = await getSpotifyToken();
+  let res;
+  try {
+    res = await httpRequestText("GET", `${SPOTIFY_API}${pathname}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    });
+  } catch (e) {
+    throw new Error(`Couldn't reach Spotify — ${e.message}`);
+  }
+  if (res.status === 200) {
+    try {
+      return JSON.parse(res.body);
+    } catch {
+      throw new Error("Spotify returned an invalid response.");
+    }
+  }
+  if (res.status === 401 && retryAuth) {
+    spotifyTokenCache.value = null;
+    return spotifyApiGet(pathname, false);
+  }
+  if (res.status === 404) throw new Error("That Spotify link is invalid or unavailable.");
+  if (res.status === 429) throw new Error("Spotify is rate-limiting this server — try again in a minute.");
+  if (res.status >= 500) throw new Error(`Spotify is having issues right now (HTTP ${res.status}) — try again.`);
+  throw new Error(`Spotify API error (HTTP ${res.status}).`);
+}
+
+function spotifyTrackFields(items) {
+  return items
+    .filter((t) => t && t.name)
+    .map((t) => ({
+      title: t.name,
+      artist: (t.artists || []).map((a) => a && a.name).filter(Boolean).join(", "),
+    }));
+}
+
+async function resolveSpotifyViaApi(ref) {
+  if (ref.type === "track") {
+    const t = await spotifyApiGet(`/tracks/${encodeURIComponent(ref.id)}`);
+    if (!t.name) throw new Error("Couldn't read that track from Spotify.");
+    return { kind: "track", title: t.name, total: 1, tracks: spotifyTrackFields([t]) };
+  }
+
+  if (ref.type === "album") {
+    const a = await spotifyApiGet(`/albums/${encodeURIComponent(ref.id)}`);
+    const tracks = spotifyTrackFields((a.tracks && Array.isArray(a.tracks.items)) ? a.tracks.items : []);
+    if (!tracks.length) throw new Error("No playable tracks found in that Spotify album.");
+    return {
+      kind: "album",
+      title: a.name || "Album",
+      total: Number(a.total_tracks) || tracks.length,
+      tracks: tracks.slice(0, SPOTIFY_MAX_TRACKS),
+    };
+  }
+
+  const list = await spotifyApiGet(`/playlists/${encodeURIComponent(ref.id)}?fields=name,tracks(total)`);
+  const page = await spotifyApiGet(`/playlists/${encodeURIComponent(ref.id)}/tracks?limit=50`);
+  const tracks = spotifyTrackFields(
+    (page.items || []).map((item) => item && item.track).filter((t) => t && t.type === "track")
+  );
+  if (!tracks.length) throw new Error("No playable tracks found in that Spotify playlist.");
+  return {
+    kind: "playlist",
+    title: list.name || "Playlist",
+    total: (list.tracks && Number(list.tracks.total)) || tracks.length,
+    tracks: tracks.slice(0, SPOTIFY_MAX_TRACKS),
+  };
 }
 
 // Resolves a Spotify track/album/playlist link into playable track metadata.
@@ -329,6 +501,15 @@ async function resolveSpotify(input) {
   }
   if (ref.type === "episode" || ref.type === "show") {
     throw new Error("Podcasts aren't supported — paste a Spotify track, album, or playlist link instead.");
+  }
+
+  if (SPOTIFY_USE_API) {
+    try {
+      return await resolveSpotifyViaApi(ref);
+    } catch (e) {
+      if (e && e.spotifyConfig) throw e; // bad credentials — surface instead of masking
+      console.warn(`Spotify API lookup failed (${e.message}) — falling back to embed metadata.`);
+    }
   }
 
   let body;
@@ -366,7 +547,7 @@ async function resolveSpotify(input) {
 
 async function getStreamUrl(url, retries = 2) {
   try {
-    const out = await runYtDlp(["-f", "bestaudio/best", "--get-url", url], 45000);
+    const out = await withYtClients(["-f", "bestaudio/best", "--get-url", url], 45000);
     return out.split(/\r?\n/)[0] || out;
   } catch (e) {
     if (retries > 0) {
@@ -979,6 +1160,11 @@ function relogin() {
 async function startBot() {
   // Ensure yt-dlp is available before accepting commands
   await ensureYtDlp();
+  console.log(
+    SPOTIFY_USE_API
+      ? "Spotify metadata: official Web API"
+      : "Spotify metadata: embed pages (set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to use the Web API)"
+  );
 
   client.on("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
@@ -1371,6 +1557,11 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Dashboard running on port ${PORT}`));
 
-module.exports = { createClient, startBot, getQueue, createQueue, play, addSongToQueue, resolveSpotify, isSpotifyLink, spotifySearchQuery, app, client };
+module.exports = {
+  createClient, startBot, getQueue, createQueue, play, addSongToQueue,
+  resolveSpotify, isSpotifyLink, spotifySearchQuery,
+  resolveVideo, getStreamUrl, withYtClients, isTransientYtError,
+  app, client,
+};
 
 startBot();

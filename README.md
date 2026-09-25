@@ -51,6 +51,11 @@ npm run dev
 | `SESSION_SECRET` | Random string used to sign dashboard sessions |
 | `BASE_URL` | Public URL of the dashboard (for OAuth redirects) |
 | `YTDLP_PATH` | Optional path to a yt-dlp binary |
+| `SPOTIFY_CLIENT_ID` | Optional — Spotify app client ID, enables official Web API metadata |
+| `SPOTIFY_CLIENT_SECRET` | Optional — Spotify app client secret (with `SPOTIFY_CLIENT_ID`) |
+| `YTDLP_COOKIES` | Optional — path to a `cookies.txt` that fixes YouTube bot checks |
+| `YTDLP_COOKIES_FROM_BROWSER` | Optional — e.g. `chrome`, logs yt-dlp in with browser cookies (local use) |
+| `YTDLP_CLIENTS` | Optional — comma-separated yt-dlp player clients tried on bot checks |
 
 ## Commands
 
@@ -83,10 +88,30 @@ Paste any Spotify link into `/play` (or the dashboard's quick-play box):
 
 How it works:
 
-- Track metadata (title, artist, playlist contents) is read from Spotify's public embed pages — **no Spotify API key or Premium account required**.
+- With `SPOTIFY_CLIENT_ID` + `SPOTIFY_CLIENT_SECRET` set, metadata (title, artist, playlist contents) comes from **Spotify's official Web API** using the client-credentials flow — no Premium account required. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard); no redirect URI is needed.
+- Without those keys the bot falls back to Spotify's public embed pages (**no API key required**), so Spotify links keep working out of the box.
 - Spotify doesn't expose audio streams to bots, so each track is matched against YouTube via yt-dlp and streamed from there.
 - Playlists/albums queue up to 50 tracks instantly; each track is resolved to its YouTube match lazily, right before it plays.
 - Podcasts (`episode`/`show` links) are not supported.
+
+## YouTube bot checks ("Sign in to confirm you're not a bot")
+
+YouTube rate-limits IPs it considers automated — especially datacenter IPs (Render, VPS). The bot handles this in three layers:
+
+1. **Automatic player-client fallback** — every yt-dlp call tries the default client first, then each client in `YTDLP_CLIENTS` (default `android_vr,web_embedded,mweb,tv_embedded`) whenever YouTube returns a bot-check or 429. Private/unavailable videos fail immediately without burning fallbacks.
+2. **Request throttling** — yt-dlp calls are serialized with a cooldown to avoid triggering rate limits in the first place.
+3. **Cookies (most reliable)** — set `YTDLP_COOKIES` to the path of a `cookies.txt` exported from a browser where you're logged into YouTube:
+
+   ```bash
+   # In .env
+   YTDLP_COOKIES=./cookies.txt
+   ```
+
+   Locally you can instead use `YTDLP_COOKIES_FROM_BROWSER=chrome` (or `firefox`, `edge`). **Never commit `cookies.txt`** — it contains your session.
+
+   On Render this is already wired up: `render.yaml` mounts a persistent disk at `/var/data` and sets `YTDLP_COOKIES=/var/data/cookies.txt`. Upload your `cookies.txt` to that disk (Render dashboard → Disks → Files, or `render disk` CLI) and it survives redeploys. Until the file exists the bot just runs without cookies.
+
+If the error persists, wait a few minutes — YouTube usually lifts the block on its own.
 
 ## Deployment (Render)
 
