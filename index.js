@@ -366,6 +366,32 @@ function parseYtDlpSearchResults(json, maxResults = 5) {
     }];
   }
 
+  if (Array.isArray(info)) {
+    return info
+      .filter((e) => e && (e.url || e.videoId))
+      .slice(0, maxResults)
+      .map((entry) => ({
+        url: entry.url || `https://www.youtube.com/watch?v=${entry.videoId}`,
+        title: entry.title || "Unknown",
+        duration: entry.lengthSeconds || entry.duration || null,
+        uploader: entry.author || entry.channel || null,
+        viewCount: entry.viewCount || null,
+      }));
+  }
+
+  if (info.items && Array.isArray(info.items)) {
+    return info.items
+      .filter((e) => e && (e.url || e.videoId))
+      .slice(0, maxResults)
+      .map((entry) => ({
+        url: entry.url || `https://www.youtube.com/watch?v=${entry.videoId}`,
+        title: entry.title || "Unknown",
+        duration: entry.lengthSeconds || entry.duration || null,
+        uploader: entry.author || entry.channel || null,
+        viewCount: entry.viewCount || null,
+      }));
+  }
+
   throw new Error("No results");
 }
 
@@ -406,17 +432,17 @@ async function searchVideo(query, maxResults = 5) {
       // Try Invidious instances for search
       for (const instance of INVIDIOUS_INSTANCES) {
         try {
-          // Use yt-dlp's invidious extractor with search
-          const invTarget = `https://${instance.replace(/^https?:\/\//, "")}/search?q=${encodeURIComponent(q)}`;
-          console.warn(`Trying Invidious search: ${invTarget}`);
+          // Try yt-dlp's invidious search extractor
+          const invTarget = `https://${instance.replace(/^https?:\/\//, "")}/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
+          console.warn(`Trying Invidious API search: ${invTarget}`);
           const { out } = await withYtClients(["-J", "--flat-playlist", invTarget]);
           const results = parseYtDlpSearchResults(out, maxResults);
-          console.log(`[searchVideo] Invidious (${instance}) returned ${results.length} results`);
+          console.log(`[searchVideo] Invidious API (${instance}) returned ${results.length} results`);
           if (results.length) {
             return results.map((r) => ({ ...r, source: "youtube", client: "invidious" }));
           }
         } catch (invErr) {
-          console.error(`Invidious search failed (${instance}):`, invErr.message);
+          console.error(`Invidious API search failed (${instance}):`, invErr.message);
         }
       }
     }
