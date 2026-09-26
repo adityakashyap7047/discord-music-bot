@@ -943,22 +943,20 @@ async function attemptPipe(song, target, client) {
   try {
     await pipe.started;
     console.log(`[attemptPipe] Success: ${song.title}`);
+    // Swap the queued search term for the real track name (and fill in the
+    // duration) while the queue still shows it — Spotify entries keep their
+    // Spotify title but still learn the duration.
+    const info = takePipeInfo(pipe);
+    if (info) {
+      if (info.title && song.source !== "spotify") song.title = info.title;
+      if (info.duration && !song.duration) song.duration = info.duration;
+    }
     return pipe;
   } catch (e) {
     console.error(`[attemptPipe] Failed: ${e.message}`);
     stopPipe(pipe);
     throw e;
   }
-}
-  // Swap the queued search term for the real track name (and fill in the
-  // duration) while the queue still shows it — Spotify entries keep their
-  // Spotify title but still learn the duration.
-  const info = takePipeInfo(pipe);
-  if (info) {
-    if (info.title && song.source !== "spotify") song.title = info.title;
-    if (info.duration && !song.duration) song.duration = info.duration;
-  }
-  return pipe;
 }
 
 // Last stream-start measurement, surfaced through /health so the deployed bot
