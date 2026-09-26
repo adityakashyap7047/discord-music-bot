@@ -249,7 +249,13 @@ function ytCookieArgs() {
 // Raw yt-dlp execution — called only via the rate-limited queue
 function runYtDlpRaw(args, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    const cmdArgs = ["--no-warnings", ...ytCookieArgs(), ...args];
+    const cmdArgs = [
+      "--no-warnings",
+      "--geo-bypass",
+      "--geo-bypass-country", "US",
+      ...ytCookieArgs(),
+      ...args
+    ];
     console.log(`[yt-dlp] Running: ${YTDLP} ${cmdArgs.join(" ")}`);
     execFile(YTDLP, cmdArgs, { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
       if (err) {
@@ -280,7 +286,7 @@ function isTransientYtError(msg) {
 }
 
 function resolveYtClients() {
-  const fallback = process.env.YTDLP_CLIENTS || "android_vr,web_embedded,mweb,tv_embedded";
+  const fallback = process.env.YTDLP_CLIENTS || "android,android_vr,android_music,web_embedded,web_music,mweb,tv_embedded,tv";
   return fallback.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
