@@ -912,10 +912,22 @@ function createPipedResource(song, target, client) {
       fn(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Timed out starting the stream")), 45000);
-    ffmpeg.stdout.once("data", () => finish(resolve));
-    ytdlp.once("error", (e) => finish(reject, e));
-    ffmpeg.once("error", (e) => finish(reject, e));
+    ffmpeg.stdout.once("data", () => {
+      console.log(`[pipe] Audio data flowing for: ${song.title}`);
+      finish(resolve);
+    });
+    ytdlp.once("error", (e) => {
+      console.error(`[pipe] yt-dlp spawn error:`, e.message);
+      finish(reject, e);
+    });
+    ffmpeg.once("error", (e) => {
+      console.error(`[pipe] ffmpeg spawn error:`, e.message);
+      finish(reject, e);
+    });
     ytdlp.once("exit", (code) => {
+      if (code !== 0) {
+        console.error(`[pipe] yt-dlp exited with code ${code}, stderr:`, stderr.slice(-500));
+      }
       // Exit code 0 just means yt-dlp finished writing — ffmpeg may still be
       // draining, so only a real failure counts as an error here.
       if (code !== 0) finish(reject, new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
@@ -926,13 +938,18 @@ function createPipedResource(song, target, client) {
 }
 
 async function attemptPipe(song, target, client) {
+  console.log(`[attemptPipe] Trying target: ${target} (client: ${client || "default"})`);
   const pipe = createPipedResource(song, target, client);
   try {
     await pipe.started;
+    console.log(`[attemptPipe] Success: ${song.title}`);
+    return pipe;
   } catch (e) {
+    console.error(`[attemptPipe] Failed: ${e.message}`);
     stopPipe(pipe);
     throw e;
   }
+}
   // Swap the queued search term for the real track name (and fill in the
   // duration) while the queue still shows it — Spotify entries keep their
   // Spotify title but still learn the duration.
@@ -954,6 +971,7 @@ let lastStreamStart = null;
 async function startSongPipe(song) {
   const t0 = Date.now();
   let failed = null;
+  console.log(`[startSongPipe] Starting for: ${song.title} (url: ${song.url || "search"})`);
   try {
     const isUrl = !!song.url;
     const clients = [null, ...resolveYtClients()];
@@ -990,11 +1008,11 @@ async function startSongPipe(song) {
     if (isUrl && isTransientYtError(lastErr?.message)) {
       const invidiousUrl = toInvidiousUrl(song.url);
       if (invidiousUrl) {
-        console.warn(`YouTube blocked direct URL — trying Invidious: ${invidiousUrl}`);
+        console.warn(`[startSongPipe] YouTube blocked direct URL — trying Invidious: ${invidiousUrl}`);
         try {
           return await attemptPipe(song, invidiousUrl, null);
         } catch (invErr) {
-          console.error("Invidious playback fallback failed:", invErr.message);
+          console.error(`[startSongPipe] Invidious playback fallback failed: ${invErr.message}`);
         }
       }
     }
@@ -1010,7 +1028,7 @@ async function startSongPipe(song) {
       source: song.source || null,
       at: new Date().toISOString(),
     };
-    if (!failed) console.log(`Stream ready in ${lastStreamStart.ms}ms (${lastStreamStart.source}) — ${song.title}`);
+    if (!failed) console.log(`[startSongPipe] Stream ready in ${lastStreamStart.ms}ms (${lastStreamStart.source}) — ${song.title}`);
   }
 }
 
