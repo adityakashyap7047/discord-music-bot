@@ -404,6 +404,24 @@ async function searchVideo(query, maxResults = 5) {
   }
 }
 
+// Invidious instances for YouTube proxy fallback (public instances, no auth needed)
+const INVIDIOUS_INSTANCES = [
+  "https://yewtu.be",
+  "https://invidious.snopyta.org",
+  "https://invidious.nerdvpn.de",
+  "https://invidious.projectsegfau.lt",
+  "https://y.ha4.eu",
+  "https://invidious.fdn.fr",
+  "https://invidious.periclase.fr",
+];
+
+function toInvidiousUrl(url) {
+  const id = youtubeIdFromUrl(url);
+  if (!id) return null;
+  const instance = INVIDIOUS_INSTANCES[Math.floor(Math.random() * INVIDIOUS_INSTANCES.length)];
+  return `${instance}/watch?v=${id}`;
+}
+
 async function resolveVideo(query, retries = 2) {
   const q = String(query || "").trim();
   const isYtUrl = isYouTubeUrl(q);
@@ -420,6 +438,20 @@ async function resolveVideo(query, retries = 2) {
         return await resolveSoundCloud(q);
       } catch (scErr) {
         console.error("SoundCloud fallback failed:", scErr.message);
+      }
+    }
+    // For direct YouTube URLs, try Invidious instances as last resort
+    if (isYtUrl && isTransientYtError(e.message)) {
+      const invidiousUrl = toInvidiousUrl(q);
+      if (invidiousUrl) {
+        console.warn(`YouTube blocked direct URL — trying Invidious: ${invidiousUrl}`);
+        try {
+          const { out } = await withYtClients(["-J", "--no-playlist", invidiousUrl]);
+          const parsed = parseYtDlpInfo(out);
+          return { ...parsed, source: "youtube", client: "invidious" };
+        } catch (invErr) {
+          console.error("Invidious fallback failed:", invErr.message);
+        }
       }
     }
     if (retries > 0) {
@@ -907,6 +939,20 @@ async function startSongPipe(song) {
         if (i < clients.length - 1) await new Promise((r) => setTimeout(r, 400));
       }
     }
+
+    // Direct YouTube URL: try Invidious instances as last resort
+    if (isUrl && isTransientYtError(lastErr?.message)) {
+      const invidiousUrl = toInvidiousUrl(song.url);
+      if (invidiousUrl) {
+        console.warn(`YouTube blocked direct URL — trying Invidious: ${invidiousUrl}`);
+        try {
+          return await attemptPipe(song, invidiousUrl, null);
+        } catch (invErr) {
+          console.error("Invidious playback fallback failed:", invErr.message);
+        }
+      }
+    }
+
     throw lastErr || firstErr;
   } catch (e) {
     failed = e;
