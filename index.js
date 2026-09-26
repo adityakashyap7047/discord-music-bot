@@ -389,13 +389,16 @@ async function searchVideo(query, maxResults = 5) {
   try {
     const { out, client } = await withYtClients(["-J", "--flat-playlist", target]);
     const results = parseYtDlpSearchResults(out, maxResults);
+    console.log(`[searchVideo] YouTube search returned ${results.length} results`);
     return results.map((r) => ({ ...r, source: "youtube", client }));
   } catch (e) {
+    console.error("[searchVideo] YouTube search error:", e.message);
     if (isTransientYtError(e.message)) {
       // Try SoundCloud first
       try {
-        console.warn(`YouTube blocked the search (${e.message.split("\n")[0]}) — falling back to SoundCloud`);
+        console.warn(`YouTube blocked the search — falling back to SoundCloud`);
         const scResult = await resolveSoundCloud(q);
+        console.log(`[searchVideo] SoundCloud returned: ${scResult.title}`);
         return [scResult];
       } catch (scErr) {
         console.error("SoundCloud fallback failed:", scErr.message);
@@ -403,10 +406,12 @@ async function searchVideo(query, maxResults = 5) {
       // Try Invidious instances for search
       for (const instance of INVIDIOUS_INSTANCES) {
         try {
-          const invTarget = `${instance}/search?q=${encodeURIComponent(q)}&type=video`;
+          // Use yt-dlp's invidious extractor with search
+          const invTarget = `https://${instance.replace(/^https?:\/\//, "")}/search?q=${encodeURIComponent(q)}`;
           console.warn(`Trying Invidious search: ${invTarget}`);
           const { out } = await withYtClients(["-J", "--flat-playlist", invTarget]);
           const results = parseYtDlpSearchResults(out, maxResults);
+          console.log(`[searchVideo] Invidious (${instance}) returned ${results.length} results`);
           if (results.length) {
             return results.map((r) => ({ ...r, source: "youtube", client: "invidious" }));
           }
