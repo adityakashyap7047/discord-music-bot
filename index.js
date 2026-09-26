@@ -2,6 +2,7 @@ require("dotenv").config();
 const {
   Client, GatewayIntentBits, ActivityType, ApplicationCommandOptionType, ChannelType,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, escapeMarkdown,
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ComponentType,
 } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, VoiceConnectionStatus, AudioPlayerStatus, StreamType } = require("@discordjs/voice");
 const { execFile, spawn } = require("child_process");
@@ -177,7 +178,7 @@ const SLASH_COMMANDS = [
   { name: "resume", description: "Resume playback" },
   { name: "queue", description: "Show the current queue" },
   { name: "loop", description: "Toggle loop mode" },
-  { name: "volume", description: "Set the playback volume", options: [{ type: ApplicationCommandOptionType.Integer, name: "level", description: "Volume from 0 to 10", required: true, min_value: 0, max_value: 10 }] },
+  { name: "volume", description: "Set the playback volume", options: [{ type: ApplicationCommandOptionType.Integer, name: "level", description: "Volume from 0 to 200", required: true, min_value: 0, max_value: 200 }] },
   { name: "remove", description: "Remove a song from the queue", options: [{ type: ApplicationCommandOptionType.Integer, name: "number", description: "Queue position (1-based)", required: true, min_value: 1 }] },
   { name: "clear", description: "Clear the queue" },
   { name: "nowplaying", description: "Show the currently playing song" },
@@ -248,9 +249,16 @@ function ytCookieArgs() {
 // Raw yt-dlp execution — called only via the rate-limited queue
 function runYtDlpRaw(args, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    execFile(YTDLP, ["--no-warnings", ...ytCookieArgs(), ...args], { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr || err.message));
-      else resolve(stdout.trim());
+    const cmdArgs = ["--no-warnings", ...ytCookieArgs(), ...args];
+    console.log(`[yt-dlp] Running: ${YTDLP} ${cmdArgs.join(" ")}`);
+    execFile(YTDLP, cmdArgs, { maxBuffer: 10 * 1024 * 1024, timeout }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[yt-dlp] Error:`, stderr || err.message);
+        reject(new Error(stderr || err.message));
+      } else {
+        console.log(`[yt-dlp] Success`);
+        resolve(stdout.trim());
+      }
     });
   });
 }
@@ -325,12 +333,69 @@ function parseYtDlpInfo(json) {
   return { url: info.webpage_url, title: info.title || "Unknown", duration: info.duration || null };
 }
 
+function parseYtDlpSearchResults(json, maxResults = 5) {
+  const info = JSON.parse(json);
+  if (!info) throw new Error("No results");
+
+  if (info._type === "playlist" && Array.isArray(info.entries)) {
+    return info.entries
+      .filter((e) => e && e.webpage_url)
+      .slice(0, maxResults)
+      .map((entry) => ({
+        url: entry.webpage_url,
+        title: entry.title || "Unknown",
+        duration: entry.duration || null,
+        uploader: entry.uploader || entry.channel || null,
+        viewCount: entry.view_count || null,
+      }));
+  }
+
+  if (info.webpage_url) {
+    return [{
+      url: info.webpage_url,
+      title: info.title || "Unknown",
+      duration: info.duration || null,
+      uploader: info.uploader || info.channel || null,
+      viewCount: info.view_count || null,
+    }];
+  }
+
+  throw new Error("No results");
+}
+
 // SoundCloud has no "not a bot" checks, so it doubles as a free fallback
 // source when YouTube blocks this server's IP.
 async function resolveSoundCloud(query) {
   const json = await runYtDlp(["-J", "--no-playlist", `scsearch1:${query}`]);
   const parsed = parseYtDlpInfo(json);
   return { ...parsed, source: "soundcloud", client: null };
+}
+
+async function searchVideo(query, maxResults = 5) {
+  const q = String(query || "").trim();
+  const isYtUrl = isYouTubeUrl(q);
+  const isScUrl = isSoundCloudUrl(q);
+  if (isYtUrl || isScUrl) {
+    const resolved = await resolveVideo(q);
+    return [resolved];
+  }
+  const target = `ytsearch${maxResults}:${q}`;
+  try {
+    const { out, client } = await withYtClients(["-J", "--flat-playlist", target]);
+    const results = parseYtDlpSearchResults(out, maxResults);
+    return results.map((r) => ({ ...r, source: "youtube", client }));
+  } catch (e) {
+    if (isTransientYtError(e.message)) {
+      try {
+        console.warn(`YouTube blocked the search (${e.message.split("\n")[0]}) — falling back to SoundCloud`);
+        const scResult = await resolveSoundCloud(q);
+        return [scResult];
+      } catch (scErr) {
+        console.error("SoundCloud fallback failed:", scErr.message);
+      }
+    }
+    throw e;
+  }
 }
 
 async function resolveVideo(query, retries = 2) {
@@ -343,8 +408,6 @@ async function resolveVideo(query, retries = 2) {
     const parsed = parseYtDlpInfo(out);
     return { ...parsed, source: isScUrl ? "soundcloud" : "youtube", client };
   } catch (e) {
-    // YouTube bot-check on a search query → retry against SoundCloud, which
-    // never asks for bot verification (only worth trying for search terms).
     if (!isYtUrl && !isScUrl && isTransientYtError(e.message)) {
       try {
         console.warn(`YouTube blocked the search (${e.message.split("\n")[0]}) — falling back to SoundCloud`);
@@ -900,7 +963,7 @@ function createQueue(guildId) {
   const q = {
     songs: [],
     history: [],                 // recently played tracks (for /previous)
-    volume: 5,
+    volume: 100,
     loop: false,
     textChannel: null,
     voiceChannel: null,
@@ -1155,10 +1218,10 @@ async function play(guildId) {
     q.connection.subscribe(q.player);
     q.player.play(pipe.resource);
     if (q.resource && q.resource.volume) {
-      q.resource.volume.setVolume(q.volume / 10);
+      q.resource.volume.setVolume(q.volume / 200);
     }
   } catch (e) {
-    console.error("Play error:", e);
+    console.error("Play error:", e.message, e.stack);
     stopPipe(pipe);
     if (q._pipe === pipe) q._pipe = null;
     if (getQueue(guildId) !== q) {
@@ -1255,76 +1318,164 @@ async function handlePlayCommand(message, args) {
 
   const query = args.join(" ");
   const spotify = isSpotifyLink(query);
-  let songs;
-  let container = null;
+  const directUrl = isYouTubeUrl(query) || isSoundCloudUrl(query);
 
-  if (spotify) {
-    let sp;
-    try {
-      sp = await resolveSpotify(query);
-    } catch (e) {
-      console.error("Spotify resolve error:", e.message);
-      return message.reply("❌ " + e.message).catch(() => {});
+  // For direct URLs and Spotify links, add directly to queue (existing behavior)
+  if (spotify || directUrl) {
+    let songs;
+    let container = null;
+
+    if (spotify) {
+      let sp;
+      try {
+        sp = await resolveSpotify(query);
+      } catch (e) {
+        console.error("Spotify resolve error:", e.message);
+        return message.reply("❌ " + e.message).catch(() => {});
+      }
+      container = sp.title;
+      songs = sp.tracks.map((t) => ({
+        url: null,
+        title: t.title,
+        artist: t.artist,
+        duration: t.duration || null,
+        search: spotifySearchQuery(t),
+        source: "spotify",
+        requester: message.author?.tag || "Unknown",
+        requesterId: message.author?.id || null,
+      }));
+      if (sp.total > sp.tracks.length) {
+        container = `${sp.title} (first ${sp.tracks.length} of ${sp.total})`;
+      }
+    } else {
+      songs = [{
+        url: query,
+        search: null,
+        title: query,
+        source: isSoundCloudUrl(query) ? "soundcloud" : "youtube",
+        requester: message.author?.tag || "Unknown",
+        requesterId: message.author?.id || null,
+      }];
     }
-    container = sp.title;
-    songs = sp.tracks.map((t) => ({
-      url: null,
-      title: t.title,
-      artist: t.artist,
-      duration: t.duration || null,
-      search: spotifySearchQuery(t),
-      source: "spotify",
-      requester: message.author?.tag || "Unknown",
-      requesterId: message.author?.id || null,
-    }));
-    if (sp.total > sp.tracks.length) {
-      container = `${sp.title} (first ${sp.tracks.length} of ${sp.total})`;
-    }
-  } else {
-    // No yt-dlp call here on purpose: resolving the search before replying is
-    // what made /play look stuck. The queue entry carries the query and the
-    // real title/duration arrive with the stream itself.
-    const direct = isYouTubeUrl(query) || isSoundCloudUrl(query);
-    songs = [{
-      url: direct ? query : null,
-      search: direct ? null : query,
-      title: query,
-      source: isSoundCloudUrl(query) ? "soundcloud" : "youtube",
-      requester: message.author?.tag || "Unknown",
-      requesterId: message.author?.id || null,
-    }];
-  }
 
-  const existing = getQueue(guildId);
-  const wasEmpty = !existing || existing.songs.length === 0;
-  const q = addSongToQueue(guildId, songs, textChannel);
-  const first = songs[0];
-  prewarmNext(guildId); // extraction overlaps the voice join below
+    const existing = getQueue(guildId);
+    const wasEmpty = !existing || existing.songs.length === 0;
+    const q = addSongToQueue(guildId, songs, textChannel);
+    const first = songs[0];
+    prewarmNext(guildId);
 
-  if (wasEmpty) {
-    message.reply(
-      songs.length > 1
-        ? `🎶 Queued **${songs.length}** tracks from **${container}** — joining voice…`
-        : `🎶 **${first.title}** — joining voice…`
-    ).catch(() => {});
-    setupVoiceConnection(guildId, voiceChannel, message);
-    try {
-      if (!q.connection) {
+    if (wasEmpty) {
+      message.reply(
+        songs.length > 1
+          ? `🎶 Queued **${songs.length}** tracks from **${container}** — joining voice…`
+          : `🎶 **${first.title}** — joining voice…`
+      ).catch(() => {});
+      setupVoiceConnection(guildId, voiceChannel, message);
+      try {
+        if (!q.connection) {
+          destroyQueue(guildId, q);
+          message.reply("❌ Could not join voice channel!").catch(() => {});
+          return;
+        }
+        await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+        play(guildId).catch(() => {});
+      } catch {
         destroyQueue(guildId, q);
         message.reply("❌ Could not join voice channel!").catch(() => {});
-        return;
       }
-      await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
-      play(guildId).catch(() => {});
-    } catch {
-      destroyQueue(guildId, q);
-      message.reply("❌ Could not join voice channel!").catch(() => {});
+    } else if (songs.length > 1) {
+      safeSend(textChannel, { content: `🎶 Added **${songs.length}** tracks from **${container}** (${q.songs.length - songs.length} already in queue)` });
+    } else {
+      safeSend(textChannel, { content: `🎶 Added to queue: **${first.title}** (${q.songs.length - 1} more in queue)` });
     }
-  } else if (songs.length > 1) {
-    safeSend(textChannel, { content: `🎶 Added **${songs.length}** tracks from **${container}** (${q.songs.length - songs.length} already in queue)` });
-  } else {
-    safeSend(textChannel, { content: `🎶 Added to queue: **${first.title}** (${q.songs.length - 1} more in queue)` });
+    return;
   }
+
+  // For search queries, show selection menu
+  try {
+    const results = await searchVideo(query, 5);
+    if (!results.length) {
+      return message.reply("❌ No results found for that search.").catch(() => {});
+    }
+
+    if (results.length === 1) {
+      // Only one result, play it directly
+      const song = {
+        url: results[0].url,
+        title: results[0].title,
+        duration: results[0].duration,
+        source: results[0].source,
+        client: results[0].client,
+        requester: message.author?.tag || "Unknown",
+        requesterId: message.author?.id || null,
+      };
+      const existing = getQueue(guildId);
+      const wasEmpty = !existing || existing.songs.length === 0;
+      const q = addSongToQueue(guildId, [song], textChannel);
+      prewarmNext(guildId);
+
+      if (wasEmpty) {
+        message.reply(`🎶 **${song.title}** — joining voice…`).catch(() => {});
+        setupVoiceConnection(guildId, voiceChannel, message);
+        try {
+          if (!q.connection) {
+            destroyQueue(guildId, q);
+            message.reply("❌ Could not join voice channel!").catch(() => {});
+            return;
+          }
+          await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+          play(guildId).catch(() => {});
+        } catch {
+          destroyQueue(guildId, q);
+          message.reply("❌ Could not join voice channel!").catch(() => {});
+        }
+      } else {
+        safeSend(textChannel, { content: `🎶 Added to queue: **${song.title}** (${q.songs.length - 1} more in queue)` });
+      }
+      return;
+    }
+
+    // Multiple results - show selection menu
+    const selectMenu = new StringSelectMenuBuilder()
+      .setCustomId(`play_select_${guildId}_${message.author.id}`)
+      .setPlaceholder("Select a song to play")
+      .addOptions(
+        results.slice(0, 5).map((r, i) => new StringSelectMenuOptionBuilder()
+          .setLabel(`${i + 1}. ${r.title}`.slice(0, 100))
+          .setDescription(`${r.uploader ? `${r.uploader} • ` : ""}${r.duration ? formatDuration(r.duration) : ""}${r.viewCount ? ` • ${formatViewCount(r.viewCount)} views` : ""}`.slice(0, 100))
+          .setValue(`${i}`)
+        )
+      );
+
+    const row = new ActionRowBuilder().addComponents(selectMenu);
+    const replyMsg = await message.reply({
+      content: `🔍 Found **${results.length}** results for "**${escapeMarkdown(query)}**" — pick one:`,
+      components: [row],
+    });
+
+    // Store results for selection handler
+    if (!global.playSearchResults) global.playSearchResults = new Map();
+    global.playSearchResults.set(`${guildId}_${message.author.id}`, { results, voiceChannel, textChannel, replyMsg });
+
+    // Cleanup after 30 seconds
+    setTimeout(() => {
+      global.playSearchResults?.delete(`${guildId}_${message.author.id}`);
+      replyMsg.edit({ components: [] }).catch(() => {});
+    }, 30000);
+
+  } catch (e) {
+    console.error("Play search error:", e.message);
+    message.reply("❌ " + describeYtDlpError(e.message)).catch(() => {});
+  }
+}
+
+function formatViewCount(count) {
+  if (!count) return "";
+  const num = Number(count);
+  if (num >= 1e9) return (num / 1e9).toFixed(1) + "B";
+  if (num >= 1e6) return (num / 1e6).toFixed(1) + "M";
+  if (num >= 1e3) return (num / 1e3).toFixed(1) + "K";
+  return num.toString();
 }
 
 function handleSkipCommand(message) {
@@ -1419,12 +1570,12 @@ function handleVolumeCommand(message, args) {
     return message.reply("❌ Nothing is playing!").catch(() => {});
   }
   const vol = parseInt(args[0]);
-  if (isNaN(vol) || vol < 0 || vol > 10) {
-    return message.reply("❌ Volume must be between 0 and 10!").catch(() => {});
+  if (isNaN(vol) || vol < 0 || vol > 200) {
+    return message.reply("❌ Volume must be between 0 and 200!").catch(() => {});
   }
   q.volume = vol;
   if (q.player && q.resource && q.resource.volume) {
-    q.resource.volume.setVolume(vol / 10);
+    q.resource.volume.setVolume(vol / 200);
   }
   message.reply(`🔊 Volume set to ${vol}`).catch(() => {});
 }
@@ -1492,7 +1643,7 @@ function handleHelpCommand(message) {
     "`/nowplaying` — Show the current song with control buttons",
     "`/shuffle` — Shuffle the queue",
     "`/loop` — Toggle loop mode",
-    "`/volume <0-10>` — Set volume",
+    "`/volume <0-200>` — Set volume",
     "`/remove <n>` — Remove a song by number",
     "`/clear` — Clear the queue",
     "`/join` / `/leave` — Join or leave your voice channel",
@@ -1530,7 +1681,7 @@ function capitalize(str) {
 function applyVolume(q, vol) {
   q.volume = vol;
   if (q.player && q.resource && q.resource.volume) {
-    q.resource.volume.setVolume(vol / 10);
+    q.resource.volume.setVolume(vol / 200);
   }
 }
 
@@ -1662,12 +1813,12 @@ async function handleNowPlayingButton(btn, guildId, q, song) {
       return;
     }
     case "np_voldown": {
-      const v = Math.max(0, q.volume - 1);
+      const v = Math.max(0, q.volume - 10);
       applyVolume(q, v);
       return btn.reply({ content: `🔉 Volume set to ${v}`, flags: 64 }).catch(() => {});
     }
     case "np_volup": {
-      const v = Math.min(10, q.volume + 1);
+      const v = Math.min(200, q.volume + 10);
       applyVolume(q, v);
       return btn.reply({ content: `🔊 Volume set to ${v}`, flags: 64 }).catch(() => {});
     }
@@ -2140,6 +2291,7 @@ function interactionCtx(interaction) {
 
 async function handleInteraction(interaction) {
   if (interaction.isButton()) return handleForeignButton(interaction);
+  if (interaction.isStringSelectMenu()) return handleSelectMenu(interaction);
   if (!interaction.isChatInputCommand()) return;
   const name = interaction.commandName;
 
@@ -2208,6 +2360,66 @@ function handleForeignButton(interaction) {
       interaction.reply({ content: "⚠️ This control has expired — use a slash command instead.", flags: 64 }).catch(() => {});
     }
   }, 2500);
+}
+
+async function handleSelectMenu(interaction) {
+  const customId = interaction.customId || "";
+  if (!customId.startsWith("play_select_")) {
+    return interaction.reply({ content: "❌ This menu has expired.", flags: 64 }).catch(() => {});
+  }
+
+  const [, , guildId, userId] = customId.split("_");
+  if (interaction.user.id !== userId) {
+    return interaction.reply({ content: "❌ Only the command user can select from this menu.", flags: 64 }).catch(() => {});
+  }
+
+  const searchData = global.playSearchResults?.get(`${guildId}_${userId}`);
+  if (!searchData) {
+    return interaction.reply({ content: "❌ This menu has expired. Please search again.", flags: 64 }).catch(() => {});
+  }
+
+  const selectedIndex = parseInt(interaction.values[0], 10);
+  const result = searchData.results[selectedIndex];
+  if (!result) {
+    return interaction.reply({ content: "❌ Invalid selection.", flags: 64 }).catch(() => {});
+  }
+
+  // Clean up
+  global.playSearchResults.delete(`${guildId}_${userId}`);
+  await interaction.update({ content: `🎶 Selected: **${escapeMarkdown(result.title)}** — joining voice…`, components: [] });
+
+  // Add to queue and play
+  const song = {
+    url: result.url,
+    title: result.title,
+    duration: result.duration,
+    source: result.source,
+    client: result.client,
+    requester: interaction.user?.tag || "Unknown",
+    requesterId: interaction.user?.id || null,
+  };
+
+  const q = addSongToQueue(guildId, [song], searchData.textChannel);
+  prewarmNext(guildId);
+
+  const wasEmpty = q.songs.length === 1;
+  if (wasEmpty) {
+    setupVoiceConnection(guildId, searchData.voiceChannel, { guild: interaction.guild, channel: searchData.textChannel });
+    try {
+      if (!q.connection) {
+        destroyQueue(guildId, q);
+        searchData.textChannel.send("❌ Could not join voice channel!").catch(() => {});
+        return;
+      }
+      await entersState(q.connection, VoiceConnectionStatus.Ready, 20000);
+      play(guildId).catch(() => {});
+    } catch {
+      destroyQueue(guildId, q);
+      searchData.textChannel.send("❌ Could not join voice channel!").catch(() => {});
+    }
+  } else {
+    safeSend(searchData.textChannel, { content: `🎶 Added to queue: **${song.title}** (${q.songs.length - 1} more in queue)` });
+  }
 }
 
 function applyPresence() {
@@ -2602,9 +2814,9 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
     case "volume": {
       if (!q) return res.status(400).json({ error: "No queue" });
       const vol = parseInt(req.body && req.body.volume, 10);
-      if (isNaN(vol) || vol < 0 || vol > 10) return res.status(400).json({ error: "Volume 0-10" });
+      if (isNaN(vol) || vol < 0 || vol > 200) return res.status(400).json({ error: "Volume 0-200" });
       q.volume = vol;
-      if (q.player && q.resource && q.resource.volume) q.resource.volume.setVolume(vol / 10);
+      if (q.player && q.resource && q.resource.volume) q.resource.volume.setVolume(vol / 200);
       break;
     }
     case "play": {
@@ -2675,9 +2887,10 @@ app.post("/api/control/:guildId/:action", requireAuth, async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    discord: client.isReady() ? "online" : "offline",
+  const discordOk = client.isReady() && client.ws.status === 0;
+  res.status(discordOk ? 200 : 503).json({
+    status: discordOk ? "ok" : "discord_disconnected",
+    discord: discordOk ? "online" : "offline",
     lastStreamStart,
     uptimeSec: Math.round(process.uptime()),
   });
@@ -2695,6 +2908,13 @@ app.use((req, res) => {
   res.status(404).send("Not found");
 });
 
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down...');
+  client.destroy();
+  for (const [guildId, q] of queue) destroyQueue(guildId, q);
+  process.exit(0);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Dashboard running on port ${PORT}`));
 
@@ -2706,3 +2926,10 @@ module.exports = {
 };
 
 startBot();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [guildId, ts] of guildPlayCooldowns) {
+    if (now - ts > 60000) guildPlayCooldowns.delete(guildId);
+  }
+}, 5 * 60 * 1000);
