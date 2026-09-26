@@ -392,12 +392,27 @@ async function searchVideo(query, maxResults = 5) {
     return results.map((r) => ({ ...r, source: "youtube", client }));
   } catch (e) {
     if (isTransientYtError(e.message)) {
+      // Try SoundCloud first
       try {
         console.warn(`YouTube blocked the search (${e.message.split("\n")[0]}) — falling back to SoundCloud`);
         const scResult = await resolveSoundCloud(q);
         return [scResult];
       } catch (scErr) {
         console.error("SoundCloud fallback failed:", scErr.message);
+      }
+      // Try Invidious instances for search
+      for (const instance of INVIDIOUS_INSTANCES) {
+        try {
+          const invTarget = `${instance}/search?q=${encodeURIComponent(q)}&type=video`;
+          console.warn(`Trying Invidious search: ${invTarget}`);
+          const { out } = await withYtClients(["-J", "--flat-playlist", invTarget]);
+          const results = parseYtDlpSearchResults(out, maxResults);
+          if (results.length) {
+            return results.map((r) => ({ ...r, source: "youtube", client: "invidious" }));
+          }
+        } catch (invErr) {
+          console.error(`Invidious search failed (${instance}):`, invErr.message);
+        }
       }
     }
     throw e;
